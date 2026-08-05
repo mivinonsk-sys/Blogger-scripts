@@ -1,16 +1,16 @@
-# pip install streamlit openai pandas
+# pip install streamlit openai pandas psycopg2-binary
 #
 # Запуск: streamlit run blogger_reels_analyzer.py
 
 import json
 import time
-import sqlite3
 import hashlib
 import secrets
 import statistics
 import html
+import psycopg2
+from psycopg2.extras import RealDictCursor
 from datetime import datetime
-from pathlib import Path
 
 import pandas as pd
 import streamlit as st
@@ -41,7 +41,6 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
-# --- УПРАВЛЕНИЕ ТЕМАМИ ---
 query_params = st.query_params
 
 if "theme" in query_params:
@@ -62,230 +61,80 @@ st.markdown(f"""
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
         <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
     </head>
-
     <style>
-    /* --- Адаптация под телефоны и ПК --- */
     @media (min-width: 992px) {{
         header[data-testid="stHeader"] {{ display: none !important; }}
-        [data-testid="stSidebarCollapseButton"],
-        [data-testid="stSidebarCollapsedControl"],
-        [data-testid="collapsedControl"] {{ display: none !important; }}
-        section[data-testid="stSidebar"] {{
-            transform: none !important;
-            visibility: visible !important;
-            min-width: 300px !important;
-        }}
+        [data-testid="stSidebarCollapseButton"], [data-testid="stSidebarCollapsedControl"], [data-testid="collapsedControl"] {{ display: none !important; }}
+        section[data-testid="stSidebar"] {{ transform: none !important; visibility: visible !important; min-width: 300px !important; }}
     }}
-
     @media (max-width: 991px) {{
         header[data-testid="stHeader"] {{ background: transparent !important; }}
-        .global-theme-switcher {{ 
-            right: 60px !important; 
-            transform: scale(0.85); 
-            transform-origin: right top; 
-        }}
+        .global-theme-switcher {{ right: 60px !important; transform: scale(0.85); transform-origin: right top; }}
         .stMainBlockContainer {{ padding-top: 4rem !important; padding-left: 1rem !important; padding-right: 1rem !important; }}
     }}
-
     html, body, [class*="css"] {{ font-family: 'Plus Jakarta Sans', sans-serif !important; }}
-
-    .global-theme-switcher {{
-        position: fixed !important; top: 20px !important; right: 30px !important;
-        width: auto !important; display: inline-flex !important; flex-direction: row !important;
-        gap: 6px; padding: 6px; border-radius: 30px; backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.2);
-        z-index: 9999999; box-shadow: 0 15px 35px rgba(0,0,0,0.35);
-    }}
+    .global-theme-switcher {{ position: fixed !important; top: 20px !important; right: 30px !important; width: auto !important; display: inline-flex !important; flex-direction: row !important; gap: 6px; padding: 6px; border-radius: 30px; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 1px solid rgba(255, 255, 255, 0.2); z-index: 9999999; box-shadow: 0 15px 35px rgba(0,0,0,0.35); }}
     .theme-night .global-theme-switcher {{ background: rgba(15, 23, 42, 0.75); border-color: rgba(56, 189, 248, 0.35); }}
     .theme-day .global-theme-switcher {{ background: rgba(255, 255, 255, 0.65); border-color: rgba(10, 142, 217, 0.2); }}
-
-    .theme-opt-btn {{
-        padding: 6px 14px; border-radius: 20px; border: none; font-weight: 700; cursor: pointer;
-        font-size: 13px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); text-decoration: none !important;
-        display: inline-block; text-align: center; white-space: nowrap;
-    }}
+    .theme-opt-btn {{ padding: 6px 14px; border-radius: 20px; border: none; font-weight: 700; cursor: pointer; font-size: 13px; transition: all 0.3s cubic-bezier(0.4, 0, 0.2, 1); text-decoration: none !important; display: inline-block; text-align: center; white-space: nowrap; }}
     .theme-night .theme-opt-btn.active {{ background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%); color: #030712 !important; box-shadow: 0 0 20px rgba(56, 189, 248, 0.6); }}
     .theme-night .theme-opt-btn.inactive {{ background: transparent; color: #94a3b8 !important; }}
     .theme-night .theme-opt-btn.inactive:hover {{ color: #ffffff !important; }}
     .theme-day .theme-opt-btn.active {{ background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%); color: #ffffff !important; box-shadow: 0 0 16px rgba(10, 142, 217, 0.35); }}
     .theme-day .theme-opt-btn.inactive {{ background: transparent; color: #5a8aa8 !important; }}
     .theme-day .theme-opt-btn.inactive:hover {{ color: #0a3a5c !important; }}
-
     @keyframes cosmicGradient {{ 0% {{background-position:0% 50%;}} 50% {{background-position:100% 50%;}} 100% {{background-position:0% 50%;}} }}
     @keyframes moveStars {{ from {{background-position:0 0;}} to {{background-position:-1000px 1000px;}} }}
-
-    .theme-night .stApp {{
-        background: linear-gradient(-45deg, #030712, #0b0f19, #0f172a, #131128, #050b14);
-        background-size: 400% 400%; animation: cosmicGradient 25s ease infinite; color: #e2e8f0 !important;
-    }}
-    .theme-night .stApp::before {{
-        content: ""; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-        background-image:
-            radial-gradient(1px 1px at 50px 100px, #ffffff, rgba(0,0,0,0)),
-            radial-gradient(2.5px 2.5px at 200px 300px, #38bdf8, rgba(0,0,0,0)),
-            radial-gradient(1.5px 1.5px at 400px 150px, #ffffff, rgba(0,0,0,0)),
-            radial-gradient(3px 3px at 650px 450px, #818cf8, rgba(0,0,0,0));
-        background-repeat: repeat; background-size: 900px 900px; opacity: 0.55;
-        animation: moveStars 140s linear infinite; pointer-events: none !important; z-index: 0 !important;
-    }}
-    .theme-night [data-testid="stSidebar"] {{
-        background-color: rgba(11, 15, 25, 0.9) !important; backdrop-filter: blur(16px);
-        -webkit-backdrop-filter: blur(16px); border-right: 1px solid rgba(255, 255, 255, 0.05);
-    }}
-
-    .glass-metric {{
-        background: rgba(15, 23, 42, 0.65) !important; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
-        border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 18px; padding: 20px;
-        box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1);
-        transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1); height: 100%; position: relative;
-    }}
+    .theme-night .stApp {{ background: linear-gradient(-45deg, #030712, #0b0f19, #0f172a, #131128, #050b14); background-size: 400% 400%; animation: cosmicGradient 25s ease infinite; color: #e2e8f0 !important; }}
+    .theme-night .stApp::before {{ content: ""; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-image: radial-gradient(1px 1px at 50px 100px, #ffffff, rgba(0,0,0,0)), radial-gradient(2.5px 2.5px at 200px 300px, #38bdf8, rgba(0,0,0,0)), radial-gradient(1.5px 1.5px at 400px 150px, #ffffff, rgba(0,0,0,0)), radial-gradient(3px 3px at 650px 450px, #818cf8, rgba(0,0,0,0)); background-repeat: repeat; background-size: 900px 900px; opacity: 0.55; animation: moveStars 140s linear infinite; pointer-events: none !important; z-index: 0 !important; }}
+    .theme-night [data-testid="stSidebar"] {{ background-color: rgba(11, 15, 25, 0.9) !important; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border-right: 1px solid rgba(255, 255, 255, 0.05); }}
+    .glass-metric {{ background: rgba(15, 23, 42, 0.65) !important; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); border: 1px solid rgba(56, 189, 248, 0.25); border-radius: 18px; padding: 20px; box-shadow: 0 10px 30px rgba(0, 0, 0, 0.4), inset 0 1px 0 rgba(255, 255, 255, 0.1); transition: all 0.3s cubic-bezier(0.16, 1, 0.3, 1); height: 100%; position: relative; }}
     .glass-metric:hover {{ transform: translateY(-4px); border-color: rgba(56, 189, 248, 0.5); box-shadow: 0 15px 35px rgba(56, 189, 248, 0.15), inset 0 1px 0 rgba(255, 255, 255, 0.2); }}
     .metric-title {{ font-size: 12px; font-weight: 600; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }}
     .metric-value {{ font-size: 20px; font-weight: 800; color: #f8fafc; letter-spacing: -0.3px; }}
     .metric-delta {{ font-size: 12px; font-weight: 600; margin-top: 6px; display: inline-block; }}
-
-    .ai-report-glass {{
-        background: rgba(15, 23, 42, 0.72) !important; backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px);
-        border: 1px solid rgba(129, 140, 248, 0.35); border-radius: 20px; padding: 26px;
-        box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.1); color: #e2e8f0;
-        margin-bottom: 18px;
-    }}
-
-    .theme-night input, .theme-night select, .theme-night textarea {{
-        background-color: rgba(15, 23, 42, 0.85) !important; color: #f1f5f9 !important;
-        border: 1px solid rgba(255, 255, 255, 0.1) !important;
-    }}
-    .theme-night div.stButton > button, .theme-night div.stFormSubmitButton > button {{
-        background: rgba(255, 255, 255, 0.15) !important; backdrop-filter: blur(8px);
-        border: 1px solid rgba(255, 255, 255, 0.3) !important; color: #f8fafc !important;
-        font-weight: 700 !important; transition: all 0.3s ease;
-    }}
-
+    .ai-report-glass {{ background: rgba(15, 23, 42, 0.72) !important; backdrop-filter: blur(22px); -webkit-backdrop-filter: blur(22px); border: 1px solid rgba(129, 140, 248, 0.35); border-radius: 20px; padding: 26px; box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5), inset 0 1px 0 rgba(255, 255, 255, 0.1); color: #e2e8f0; margin-bottom: 18px; }}
+    .theme-night input, .theme-night select, .theme-night textarea {{ background-color: rgba(15, 23, 42, 0.85) !important; color: #f1f5f9 !important; border: 1px solid rgba(255, 255, 255, 0.1) !important; }}
+    .theme-night div.stButton > button, .theme-night div.stFormSubmitButton > button {{ background: rgba(255, 255, 255, 0.15) !important; backdrop-filter: blur(8px); border: 1px solid rgba(255, 255, 255, 0.3) !important; color: #f8fafc !important; font-weight: 700 !important; transition: all 0.3s ease; }}
     @keyframes dayGradient {{ 0% {{background-position:0% 50%;}} 50% {{background-position:100% 50%;}} 100% {{background-position:0% 50%;}} }}
-    .theme-day .stApp {{
-        background: linear-gradient(135deg, #e8f4fd 0%, #d0ecfb 30%, #b8e2f8 60%, #a0d8f4 100%);
-        background-size: 300% 300%; animation: dayGradient 40s ease infinite; color: #0a3a5c !important;
-    }}
-    .theme-day .stApp::before {{
-        content: ""; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh;
-        background-image:
-            radial-gradient(500px 250px at 15% 25%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 70%),
-            radial-gradient(600px 300px at 55% 65%, rgba(255,255,255,0.35) 0%, rgba(255,255,255,0) 70%),
-            radial-gradient(400px 200px at 85% 20%, rgba(255,255,255,0.4) 0%, rgba(255,255,255,0) 70%);
-        pointer-events: none !important; z-index: 0 !important;
-    }}
+    .theme-day .stApp {{ background: linear-gradient(135deg, #e8f4fd 0%, #d0ecfb 30%, #b8e2f8 60%, #a0d8f4 100%); background-size: 300% 300%; animation: dayGradient 40s ease infinite; color: #0a3a5c !important; }}
+    .theme-day .stApp::before {{ content: ""; position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; background-image: radial-gradient(500px 250px at 15% 25%, rgba(255,255,255,0.45) 0%, rgba(255,255,255,0) 70%), radial-gradient(600px 300px at 55% 65%, rgba(255,255,255,0.35) 0%, rgba(255,255,255,0) 70%), radial-gradient(400px 200px at 85% 20%, rgba(255,255,255,0.4) 0%, rgba(255,255,255,0) 70%); pointer-events: none !important; z-index: 0 !important; }}
     .stMainBlockContainer, [data-testid="stSidebar"], .global-theme-switcher {{ position: relative; z-index: 2 !important; }}
-
-    .theme-day [data-testid="stSidebar"] {{
-        background: rgba(255,255,255,0.72) !important;
-        backdrop-filter: blur(20px) saturate(1.4); -webkit-backdrop-filter: blur(20px) saturate(1.4);
-        border-right: 0.5px solid rgba(10,142,217,0.15) !important;
-    }}
-    .theme-day [data-testid="stSidebar"] label,
-    .theme-day [data-testid="stSidebar"] span,
-    .theme-day [data-testid="stSidebar"] p {{
-        color: #0a3a5c !important;
-    }}
-    .theme-day [data-testid="stSidebar"] div {{
-        color: #1a5a7a !important;
-    }}
-    .theme-day [data-testid="stSidebar"] .stSelectbox label,
-    .theme-day [data-testid="stSidebar"] .stNumberInput label,
-    .theme-day [data-testid="stSidebar"] .stTextInput label,
-    .theme-day [data-testid="stSidebar"] .stTextArea label,
-    .theme-day [data-testid="stSidebar"] .stCheckbox label {{
-        font-size: 12px !important; font-weight: 700 !important; color: #3a6a88 !important;
-        text-transform: uppercase !important; letter-spacing: 0.4px !important;
-    }}
-    .theme-day [data-testid="stSidebar"] h3 {{
-        color: #0a3a5c !important; font-size: 14px !important; font-weight: 700 !important;
-    }}
-
-    .theme-day .glass-metric {{
-        background: rgba(255,255,255,0.65) !important;
-        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-        border: 0.5px solid rgba(10,142,217,0.15) !important; border-radius: 14px !important;
-        box-shadow: none !important;
-    }}
-    .theme-day .glass-metric:hover {{
-        border-color: rgba(10,142,217,0.35) !important;
-        transform: translateY(-3px);
-        box-shadow: 0 8px 24px rgba(10,142,217,0.1) !important;
-    }}
+    .theme-day [data-testid="stSidebar"] {{ background: rgba(255,255,255,0.72) !important; backdrop-filter: blur(20px) saturate(1.4); -webkit-backdrop-filter: blur(20px) saturate(1.4); border-right: 0.5px solid rgba(10,142,217,0.15) !important; }}
+    .theme-day [data-testid="stSidebar"] label, .theme-day [data-testid="stSidebar"] span, .theme-day [data-testid="stSidebar"] p {{ color: #0a3a5c !important; }}
+    .theme-day [data-testid="stSidebar"] div {{ color: #1a5a7a !important; }}
+    .theme-day [data-testid="stSidebar"] .stSelectbox label, .theme-day [data-testid="stSidebar"] .stNumberInput label, .theme-day [data-testid="stSidebar"] .stTextInput label, .theme-day [data-testid="stSidebar"] .stTextArea label, .theme-day [data-testid="stSidebar"] .stCheckbox label {{ font-size: 12px !important; font-weight: 700 !important; color: #3a6a88 !important; text-transform: uppercase !important; letter-spacing: 0.4px !important; }}
+    .theme-day [data-testid="stSidebar"] h3 {{ color: #0a3a5c !important; font-size: 14px !important; font-weight: 700 !important; }}
+    .theme-day .glass-metric {{ background: rgba(255,255,255,0.65) !important; backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); border: 0.5px solid rgba(10,142,217,0.15) !important; border-radius: 14px !important; box-shadow: none !important; }}
+    .theme-day .glass-metric:hover {{ border-color: rgba(10,142,217,0.35) !important; transform: translateY(-3px); box-shadow: 0 8px 24px rgba(10,142,217,0.1) !important; }}
     .theme-day .metric-title {{ color: #5a8aa8 !important; }}
     .theme-day .metric-value {{ color: #0a3a5c !important; }}
-
-    .theme-day .ai-report-glass {{
-        background: rgba(255,255,255,0.7) !important;
-        backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
-        border: 0.5px solid rgba(10,142,217,0.18) !important; border-radius: 14px !important;
-        box-shadow: none !important; color: #0a3a5c !important;
-    }}
-
-    .theme-day input, .theme-day select, .theme-day textarea {{
-        background: rgba(255,255,255,0.8) !important; color: #0a3a5c !important;
-        border: 0.5px solid rgba(10,142,217,0.25) !important; border-radius: 8px !important;
-    }}
-    .theme-day input:focus, .theme-day select:focus, .theme-day textarea:focus {{
-        border-color: rgba(10,142,217,0.5) !important;
-        box-shadow: 0 0 0 2px rgba(10,142,217,0.1) !important;
-    }}
-
+    .theme-day .ai-report-glass {{ background: rgba(255,255,255,0.7) !important; backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px); border: 0.5px solid rgba(10,142,217,0.18) !important; border-radius: 14px !important; box-shadow: none !important; color: #0a3a5c !important; }}
+    .theme-day input, .theme-day select, .theme-day textarea {{ background: rgba(255,255,255,0.8) !important; color: #0a3a5c !important; border: 0.5px solid rgba(10,142,217,0.25) !important; border-radius: 8px !important; }}
+    .theme-day input:focus, .theme-day select:focus, .theme-day textarea:focus {{ border-color: rgba(10,142,217,0.5) !important; box-shadow: 0 0 0 2px rgba(10,142,217,0.1) !important; }}
     .theme-day h1, .theme-day h2, .theme-day h3, .theme-day h4 {{ color: #0a3a5c !important; }}
     .theme-day span, .theme-day p {{ color: #1a5a7a !important; }}
-
-    .theme-day div.stButton > button,
-    .theme-day div.stFormSubmitButton > button {{
-        background: rgba(255,255,255,0.6) !important;
-        border: 0.5px solid rgba(10,142,217,0.25) !important; border-radius: 10px !important;
-        color: #0a8ed9 !important; font-weight: 700 !important;
-        transition: all 0.25s ease !important;
-    }}
-    .theme-day div.stButton > button:hover,
-    .theme-day div.stFormSubmitButton > button:hover {{
-        background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%) !important;
-        border-color: #0a8ed9 !important; color: #ffffff !important;
-        transform: translateY(-2px); box-shadow: 0 6px 20px rgba(10,142,217,0.25) !important;
-    }}
-    .theme-day div.stButton > button[kind="primary"],
-    .theme-day div.stFormSubmitButton > button[kind="primary"] {{
-        background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%) !important;
-        color: #ffffff !important; border-color: transparent !important;
-    }}
-    .theme-day div.stButton > button[kind="primary"]:hover {{
-        box-shadow: 0 8px 24px rgba(10,142,217,0.35) !important; transform: translateY(-2px);
-    }}
-
+    .theme-day div.stButton > button, .theme-day div.stFormSubmitButton > button {{ background: rgba(255,255,255,0.6) !important; border: 0.5px solid rgba(10,142,217,0.25) !important; border-radius: 10px !important; color: #0a8ed9 !important; font-weight: 700 !important; transition: all 0.25s ease !important; }}
+    .theme-day div.stButton > button:hover, .theme-day div.stFormSubmitButton > button:hover {{ background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%) !important; border-color: #0a8ed9 !important; color: #ffffff !important; transform: translateY(-2px); box-shadow: 0 6px 20px rgba(10,142,217,0.25) !important; }}
+    .theme-day div.stButton > button[kind="primary"], .theme-day div.stFormSubmitButton > button[kind="primary"] {{ background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%) !important; color: #ffffff !important; border-color: transparent !important; }}
+    .theme-day div.stButton > button[kind="primary"]:hover {{ box-shadow: 0 8px 24px rgba(10,142,217,0.35) !important; transform: translateY(-2px); }}
     .theme-day .badge-high {{ background: rgba(16,185,129,0.1) !important; color: #0d9668 !important; border-color: rgba(16,185,129,0.3) !important; }}
     .theme-day .badge-medium {{ background: rgba(245,158,11,0.1) !important; color: #b45309 !important; border-color: rgba(245,158,11,0.3) !important; }}
     .theme-day .badge-low {{ background: rgba(99,102,241,0.1) !important; color: #5346b5 !important; border-color: rgba(99,102,241,0.3) !important; }}
     .theme-day .fit-high {{ color: #0d9668 !important; }}
     .theme-day .fit-medium {{ color: #b45309 !important; }}
     .theme-day .fit-low {{ color: #dc2626 !important; }}
-
-    .theme-day .custom-warning {{
-        background: rgba(10,142,217,0.06) !important; border-color: rgba(10,142,217,0.2) !important;
-        color: #1a5a8a !important;
-    }}
-    .theme-day .custom-error {{
-        background: rgba(220,38,38,0.06) !important; border-color: rgba(220,38,38,0.3) !important;
-        color: #dc2626 !important;
-    }}
+    .theme-day .custom-warning {{ background: rgba(10,142,217,0.06) !important; border-color: rgba(10,142,217,0.2) !important; color: #1a5a8a !important; }}
+    .theme-day .custom-error {{ background: rgba(220,38,38,0.06) !important; border-color: rgba(220,38,38,0.3) !important; color: #dc2626 !important; }}
     [data-testid="stWarning"], [data-testid="stError"] {{ display: none !important; }}
-
     .fit-high {{ color: #10b981; font-weight: 800; }}
     .fit-medium {{ color: #f59e0b; font-weight: 800; }}
     .fit-low {{ color: #ef4444; font-weight: 800; }}
-    .pattern-badge {{
-        display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700;
-        margin-right: 6px; margin-bottom: 6px;
-    }}
+    .pattern-badge {{ display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700; margin-right: 6px; margin-bottom: 6px; }}
     .badge-high {{ background: rgba(16,185,129,0.18); color: #10b981; border: 1px solid rgba(16,185,129,0.4); }}
     .badge-medium {{ background: rgba(245,158,11,0.18); color: #f59e0b; border: 1px solid rgba(245,158,11,0.4); }}
     .badge-low {{ background: rgba(239,68,68,0.18); color: #ef4444; border: 1px solid rgba(239,68,68,0.4); }}
-
     .fade-in-container {{ animation: smoothAppearScale 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards; }}
-
     .pin-wrap {{ max-width: 460px; margin: 40px auto 4px; text-align: center; }}
     .pin-title {{ font-size: 24px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.4px; }}
     .pin-subtitle {{ font-size: 14px; margin-bottom: 22px; line-height: 1.5; }}
@@ -293,89 +142,36 @@ st.markdown(f"""
     .theme-day .pin-subtitle {{ color: #5a8aa8; }}
     .theme-night .pin-title {{ color: #f8fafc; }}
     .theme-night .pin-subtitle {{ color: #94a3b8; }}
-
-    .pin-single div[data-testid="stTextInput"] input {{
-        text-align: center !important;
-        font-size: 30px !important;
-        font-weight: 700 !important;
-        letter-spacing: 18px !important;
-        text-indent: 18px !important;
-        height: 66px !important;
-        border-radius: 14px !important;
-        transition: all 0.2s ease !important;
-    }}
-    .theme-day .pin-single div[data-testid="stTextInput"] input {{
-        background: rgba(255,255,255,0.85) !important;
-        border: 1.5px solid rgba(10,142,217,0.25) !important;
-        color: #0a3a5c !important;
-    }}
-    .theme-day .pin-single div[data-testid="stTextInput"] input:focus {{
-        border-color: #0a8ed9 !important;
-        box-shadow: 0 0 0 3px rgba(10,142,217,0.12) !important;
-    }}
-    .theme-night .pin-single div[data-testid="stTextInput"] input {{
-        background: #1e1e1e !important;
-        border: 1.5px solid rgba(255,255,255,0.15) !important;
-        color: #ffffff !important;
-    }}
-    .theme-night .pin-single div[data-testid="stTextInput"] input:focus {{
-        border-color: #ffffff !important;
-        box-shadow: 0 0 0 3px rgba(255,255,255,0.08) !important;
-    }}
+    .pin-single div[data-testid="stTextInput"] input {{ text-align: center !important; font-size: 30px !important; font-weight: 700 !important; letter-spacing: 18px !important; text-indent: 18px !important; height: 66px !important; border-radius: 14px !important; transition: all 0.2s ease !important; }}
+    .theme-day .pin-single div[data-testid="stTextInput"] input {{ background: rgba(255,255,255,0.85) !important; border: 1.5px solid rgba(10,142,217,0.25) !important; color: #0a3a5c !important; }}
+    .theme-day .pin-single div[data-testid="stTextInput"] input:focus {{ border-color: #0a8ed9 !important; box-shadow: 0 0 0 3px rgba(10,142,217,0.12) !important; }}
+    .theme-night .pin-single div[data-testid="stTextInput"] input {{ background: #1e1e1e !important; border: 1.5px solid rgba(255,255,255,0.15) !important; color: #ffffff !important; }}
+    .theme-night .pin-single div[data-testid="stTextInput"] input:focus {{ border-color: #ffffff !important; box-shadow: 0 0 0 3px rgba(255,255,255,0.08) !important; }}
     .pin-single div[data-testid="stTextInput"] button {{ display: none !important; }}
     .pin-single div[data-testid="stTextInput"] label {{ display: none !important; }}
-
-    .history-card {{
-        border-radius: 14px; padding: 16px 18px; margin-bottom: 10px;
-        transition: all 0.25s ease; position: relative;
-    }}
-    .theme-day .history-card {{
-        background: rgba(255,255,255,0.68); border: 0.5px solid rgba(10,142,217,0.18);
-    }}
-    .theme-day .history-card:hover {{
-        border-color: rgba(10,142,217,0.4); transform: translateY(-2px);
-        box-shadow: 0 6px 20px rgba(10,142,217,0.1);
-    }}
-    .theme-night .history-card {{
-        background: rgba(15,23,42,0.65); border: 1px solid rgba(56,189,248,0.2);
-        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-    }}
-    .theme-night .history-card:hover {{
-        border-color: rgba(56,189,248,0.45); transform: translateY(-2px);
-    }}
+    .history-card {{ border-radius: 14px; padding: 16px 18px; margin-bottom: 10px; transition: all 0.25s ease; position: relative; }}
+    .theme-day .history-card {{ background: rgba(255,255,255,0.68); border: 0.5px solid rgba(10,142,217,0.18); }}
+    .theme-day .history-card:hover {{ border-color: rgba(10,142,217,0.4); transform: translateY(-2px); box-shadow: 0 6px 20px rgba(10,142,217,0.1); }}
+    .theme-night .history-card {{ background: rgba(15,23,42,0.65); border: 1px solid rgba(56,189,248,0.2); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }}
+    .theme-night .history-card:hover {{ border-color: rgba(56,189,248,0.45); transform: translateY(-2px); }}
     .history-handle {{ font-size: 16px; font-weight: 800; letter-spacing: -0.2px; }}
     .theme-day .history-handle {{ color: #0a3a5c; }}
     .theme-night .history-handle {{ color: #f8fafc; }}
     .history-date {{ font-size: 12px; font-weight: 600; }}
     .theme-day .history-date {{ color: #5a8aa8; }}
     .theme-night .history-date {{ color: #94a3b8; }}
-    .history-chip {{
-        display: inline-block; padding: 3px 10px; border-radius: 12px;
-        font-size: 11px; font-weight: 700; margin-right: 6px; margin-top: 8px;
-    }}
-    .theme-day .history-chip {{
-        background: rgba(10,142,217,0.08); color: #0a8ed9; border: 0.5px solid rgba(10,142,217,0.2);
-    }}
-    .theme-night .history-chip {{
-        background: rgba(56,189,248,0.12); color: #38bdf8; border: 1px solid rgba(56,189,248,0.25);
-    }}
-    .manager-stat-card {{
-        border-radius: 14px; padding: 18px; text-align: center; transition: all 0.25s ease;
-    }}
-    .theme-day .manager-stat-card {{
-        background: rgba(255,255,255,0.68); border: 0.5px solid rgba(10,142,217,0.18);
-    }}
-    .theme-night .manager-stat-card {{
-        background: rgba(15,23,42,0.65); border: 1px solid rgba(56,189,248,0.2);
-        backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
-    }}
-    .empty-state {{
-        text-align: center; padding: 48px 24px; border-radius: 16px;
-    }}
+    .history-chip {{ display: inline-block; padding: 3px 10px; border-radius: 12px; font-size: 11px; font-weight: 700; margin-right: 6px; margin-top: 8px; }}
+    .theme-day .history-chip {{ background: rgba(10,142,217,0.08); color: #0a8ed9; border: 0.5px solid rgba(10,142,217,0.2); }}
+    .theme-night .history-chip {{ background: rgba(56,189,248,0.12); color: #38bdf8; border: 1px solid rgba(56,189,248,0.25); }}
+    .manager-stat-card {{ border-radius: 14px; padding: 18px; text-align: center; transition: all 0.25s ease; }}
+    .theme-day .manager-stat-card {{ background: rgba(255,255,255,0.68); border: 0.5px solid rgba(10,142,217,0.18); }}
+    .theme-night .manager-stat-card {{ background: rgba(15,23,42,0.65); border: 1px solid rgba(56,189,248,0.2); backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px); }}
+    .empty-state {{ text-align: center; padding: 48px 24px; border-radius: 16px; }}
     .theme-day .empty-state {{ background: rgba(255,255,255,0.45); color: #5a8aa8; }}
     .theme-night .empty-state {{ background: rgba(15,23,42,0.4); color: #94a3b8; }}
     @keyframes smoothAppearScale {{ from {{opacity:0; transform: translateY(15px) scale(0.92);}} to {{opacity:1; transform: translateY(0) scale(1);}} }}
-
+    .custom-warning {{ padding: 18px 24px; border-radius: 14px; background: rgba(14,165,233,0.12); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(14,165,233,0.4); display: flex; align-items: center; gap: 12px; margin-bottom: 20px; font-weight: 600; }}
+    .custom-error {{ padding: 18px 24px; border-radius: 14px; background: rgba(239,68,68,0.12); backdrop-filter: blur(14px); -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(239,68,68,0.5); display: flex; align-items: center; gap: 12px; margin-bottom: 24px; font-weight: 600; color: #f87171; }}
     </style>
 """, unsafe_allow_html=True)
 
@@ -411,69 +207,77 @@ try {{
 """, height=0, width=0)
 
 # ============================================================================
-# ХРАНИЛИЩЕ ДАННЫХ (SQLite)
-# ВНИМАНИЕ: На бесплатных серверах вроде Streamlit Community Cloud эта БД 
-# обнуляется при перезапуске (засыпании) сервера. Для продакшена используйте 
-# внешнее облачное хранилище.
+# ХРАНИЛИЩЕ ДАННЫХ (PostgreSQL / Supabase)
 # ============================================================================
-DB_PATH = Path(__file__).parent / "blogger_analyses.db"
 
-def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+def get_db_connection():
+    """Подключение к PostgreSQL через секреты Streamlit"""
+    try:
+        # Пытаемся получить URL из секретов
+        db_url = st.secrets["postgres"]["url"]
+        conn = psycopg2.connect(db_url)
+        conn.autocommit = True  # Для простоты транзакций как в SQLite
+        return conn
+    except Exception as e:
+        st.error("🚨 Ошибка подключения к базе данных! Проверьте секреты в Streamlit Cloud.")
+        st.stop()
 
 def init_db():
-    with db_connect() as conn:
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                manager TEXT NOT NULL,
-                blogger_url TEXT NOT NULL,
-                blogger_handle TEXT,
-                created_at TEXT NOT NULL,
-                data_source TEXT,
-                model_used TEXT,
-                reels_count INTEGER,
-                median_views INTEGER,
-                viral_count INTEGER,
-                product_brief TEXT,
-                metrics_json TEXT,
-                top_viral_json TEXT,
-                result_json TEXT
-            )
-        """)
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
-        conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS managers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                name TEXT NOT NULL UNIQUE,
-                password_hash TEXT,
-                salt TEXT,
-                is_active INTEGER NOT NULL DEFAULT 1,
-                created_at TEXT NOT NULL
-            )
-        """)
-        conn.execute("""
-            CREATE TABLE IF NOT EXISTS app_settings (
-                key TEXT PRIMARY KEY,
-                value TEXT
-            )
-        """)
-        existing = conn.execute("SELECT COUNT(*) AS c FROM managers").fetchone()["c"]
-        if existing == 0:
-            seed = [
-                "Анастасия Виницкая", "Андрей Колмагоров", "Диана Комисарова",
-                "Екатерина Гантимурова", "Екатерина Зиновьева", "Катерина Запара",
-                "Марина Казьмина", "Марина Капитанова", "Оксана Шульга",
-                "Ольга Ребреева", "Юлия Ильина",
-            ]
-            now = datetime.now().isoformat(timespec="seconds")
-            conn.executemany(
-                "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (?, NULL, NULL, 1, ?)",
-                [(n, now) for n in seed],
-            )
+    with get_db_connection() as conn:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS analyses (
+                    id SERIAL PRIMARY KEY,
+                    manager TEXT NOT NULL,
+                    blogger_url TEXT NOT NULL,
+                    blogger_handle TEXT,
+                    created_at TEXT NOT NULL,
+                    data_source TEXT,
+                    model_used TEXT,
+                    reels_count INTEGER,
+                    median_views INTEGER,
+                    viral_count INTEGER,
+                    product_brief TEXT,
+                    metrics_json TEXT,
+                    top_viral_json TEXT,
+                    result_json TEXT
+                )
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
+            
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS managers (
+                    id SERIAL PRIMARY KEY,
+                    name TEXT NOT NULL UNIQUE,
+                    password_hash TEXT,
+                    salt TEXT,
+                    is_active INTEGER NOT NULL DEFAULT 1,
+                    created_at TEXT NOT NULL
+                )
+            """)
+            cur.execute("""
+                CREATE TABLE IF NOT EXISTS app_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT
+                )
+            """)
+            
+            cur.execute("SELECT COUNT(*) AS c FROM managers")
+            existing = cur.fetchone()["c"]
+            if existing == 0:
+                seed = [
+                    "Анастасия Виницкая", "Андрей Колмагоров", "Диана Комисарова",
+                    "Екатерина Гантимурова", "Екатерина Зиновьева", "Катерина Запара",
+                    "Марина Казьмина", "Марина Капитанова", "Оксана Шульга",
+                    "Ольга Ребреева", "Юлия Ильина",
+                ]
+                now = datetime.now().isoformat(timespec="seconds")
+                for n in seed:
+                    cur.execute(
+                        "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (%s, NULL, NULL, 1, %s) ON CONFLICT DO NOTHING",
+                        (n, now)
+                    )
 
 def hash_password(password: str, salt: str = None):
     if salt is None:
@@ -489,20 +293,23 @@ def verify_password(password: str, password_hash: str, salt: str) -> bool:
 
 def get_managers(active_only=True):
     try:
-        with db_connect() as conn:
-            q = "SELECT * FROM managers"
-            if active_only:
-                q += " WHERE is_active = 1"
-            q += " ORDER BY name"
-            return [dict(r) for r in conn.execute(q).fetchall()]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                q = "SELECT * FROM managers"
+                if active_only: q += " WHERE is_active = 1"
+                q += " ORDER BY name"
+                cur.execute(q)
+                return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
 
 def get_manager(name):
     try:
-        with db_connect() as conn:
-            row = conn.execute("SELECT * FROM managers WHERE name = ?", (name,)).fetchone()
-            return dict(row) if row else None
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT * FROM managers WHERE name = %s", (name,))
+                row = cur.fetchone()
+                return dict(row) if row else None
     except Exception:
         return None
 
@@ -512,13 +319,14 @@ def add_manager(name, password=None):
     if len(name) > 100: return False, "Имя слишком длинное."
     try:
         pw_hash, salt = hash_password(password) if password else (None, None)
-        with db_connect() as conn:
-            conn.execute(
-                "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (?, ?, ?, 1, ?)",
-                (name, pw_hash, salt, datetime.now().isoformat(timespec="seconds")),
-            )
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (%s, %s, %s, 1, %s)",
+                    (name, pw_hash, salt, datetime.now().isoformat(timespec="seconds")),
+                )
         return True, f"Менеджер «{name}» добавлен."
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, f"Менеджер «{name}» уже существует."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
@@ -526,8 +334,9 @@ def add_manager(name, password=None):
 def set_manager_password(name, password):
     try:
         pw_hash, salt = hash_password(password) if password else (None, None)
-        with db_connect() as conn:
-            conn.execute("UPDATE managers SET password_hash = ?, salt = ? WHERE name = ?", (pw_hash, salt, name))
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE managers SET password_hash = %s, salt = %s WHERE name = %s", (pw_hash, salt, name))
         return True, ("PIN установлен." if password else "PIN снят — вход без PIN.")
     except Exception as exc:
         return False, f"Ошибка: {exc}"
@@ -536,53 +345,60 @@ def rename_manager(old_name, new_name):
     new_name = (new_name or "").strip()
     if not new_name: return False, "Новое имя не может быть пустым."
     try:
-        with db_connect() as conn:
-            conn.execute("UPDATE managers SET name = ? WHERE name = ?", (new_name, old_name))
-            conn.execute("UPDATE analyses SET manager = ? WHERE manager = ?", (new_name, old_name))
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("UPDATE managers SET name = %s WHERE name = %s", (new_name, old_name))
+                cur.execute("UPDATE analyses SET manager = %s WHERE manager = %s", (new_name, old_name))
         return True, f"Переименован: «{old_name}» → «{new_name}»."
-    except sqlite3.IntegrityError:
+    except psycopg2.IntegrityError:
         return False, f"Менеджер «{new_name}» уже существует."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
 def delete_manager(name, delete_history=False):
     try:
-        with db_connect() as conn:
-            conn.execute("DELETE FROM managers WHERE name = ?", (name,))
-            if delete_history:
-                conn.execute("DELETE FROM analyses WHERE manager = ?", (name,))
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM managers WHERE name = %s", (name,))
+                if delete_history:
+                    cur.execute("DELETE FROM analyses WHERE manager = %s", (name,))
         return True, "Менеджер удален."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
 def count_manager_analyses(name):
     try:
-        with db_connect() as conn:
-            return conn.execute("SELECT COUNT(*) AS c FROM analyses WHERE manager = ?", (name,)).fetchone()["c"]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT COUNT(*) AS c FROM analyses WHERE manager = %s", (name,))
+                return cur.fetchone()["c"]
     except Exception:
         return 0
 
 def get_setting(key, default=None):
     try:
-        with db_connect() as conn:
-            row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
-            return row["value"] if row else default
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
+                row = cur.fetchone()
+                return row["value"] if row else default
     except Exception:
         return default
 
 def set_setting(key, value):
     try:
-        with db_connect() as conn:
-            conn.execute(
-                "INSERT INTO app_settings (key, value) VALUES (?, ?) "
-                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-                (key, str(value)),
-            )
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
+                    (key, str(value)),
+                )
         return True
-    except Exception:
+    except Exception as e:
+        print(e)
         return False
 
-# Вспомогательные функции для типизированного чтения из БД
 def load_setting_str(key, default=""):
     val = get_setting(key)
     return val if val is not None else default
@@ -618,7 +434,7 @@ def admin_pin_is_default() -> bool:
     return not (get_setting("admin_pin_hash") and get_setting("admin_pin_salt"))
 
 # ============================================================================
-# ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ИЗ БАЗЫ ДАННЫХ (ГЛОБАЛЬНЫЕ НАСТРОЙКИ)
+# ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ИЗ БАЗЫ ДАННЫХ
 # ============================================================================
 DEFAULT_BRIEF_TEXT = (
     "Товар: утягивающие майки (женское корректирующее бельё/топы).\n"
@@ -677,6 +493,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "}"
 )
 
+# Инициализируем Postgres таблицы
 init_db()
 
 if "admin_logged_in" not in st.session_state:
@@ -685,7 +502,7 @@ if "admin_logged_in" not in st.session_state:
 if "manager_logged_in" not in st.session_state:
     st.session_state.manager_logged_in = None
 
-# Загружаем настройки из БД для всех пользователей один раз при старте сессии
+# Загружаем настройки 1 раз при старте
 if "settings_loaded" not in st.session_state:
     st.session_state.cfg_ai_provider_mode = load_setting_str("cfg_ai_provider_mode", "openrouter")
     st.session_state.cfg_ai_base_url = load_setting_str("cfg_ai_base_url", "https://openrouter.ai/api/v1")
@@ -1012,50 +829,55 @@ def save_analysis(manager, blogger_url, blogger_handle, data_source, model_used,
                   reels_count, median_views, viral_count, product_brief,
                   metrics_df, top_viral_df, result):
     try:
-        with db_connect() as conn:
-            cur = conn.execute("""
-                INSERT INTO analyses (manager, blogger_url, blogger_handle, created_at, data_source,
-                                      model_used, reels_count, median_views, viral_count, product_brief,
-                                      metrics_json, top_viral_json, result_json)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """, (
-                manager, blogger_url, blogger_handle, datetime.now().isoformat(timespec="seconds"),
-                data_source, model_used, int(reels_count), int(median_views), int(viral_count),
-                product_brief,
-                metrics_df.to_json(orient="records", force_ascii=False) if metrics_df is not None else "[]",
-                top_viral_df.to_json(orient="records", force_ascii=False) if top_viral_df is not None else "[]",
-                json.dumps(result, ensure_ascii=False),
-            ))
-            return cur.lastrowid
-    except Exception:
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    INSERT INTO analyses (manager, blogger_url, blogger_handle, created_at, data_source,
+                                          model_used, reels_count, median_views, viral_count, product_brief,
+                                          metrics_json, top_viral_json, result_json)
+                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+                """, (
+                    manager, blogger_url, blogger_handle, datetime.now().isoformat(timespec="seconds"),
+                    data_source, model_used, int(reels_count), int(median_views), int(viral_count),
+                    product_brief,
+                    metrics_df.to_json(orient="records", force_ascii=False) if metrics_df is not None else "[]",
+                    top_viral_df.to_json(orient="records", force_ascii=False) if top_viral_df is not None else "[]",
+                    json.dumps(result, ensure_ascii=False),
+                ))
+                return cur.fetchone()["id"]
+    except Exception as e:
+        print(f"Error saving analysis: {e}")
         return None
 
 def get_analyses(manager=None, limit=500):
     try:
-        with db_connect() as conn:
-            if manager:
-                rows = conn.execute("SELECT * FROM analyses WHERE manager = ? ORDER BY created_at DESC LIMIT ?", (manager, limit)).fetchall()
-            else:
-                rows = conn.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
-            return [dict(r) for r in rows]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                if manager:
+                    cur.execute("SELECT * FROM analyses WHERE manager = %s ORDER BY created_at DESC LIMIT %s", (manager, limit))
+                else:
+                    cur.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT %s", (limit,))
+                return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
 
 def get_manager_stats():
     try:
-        with db_connect() as conn:
-            rows = conn.execute("""
-                SELECT manager, COUNT(*) AS total_analyses, COUNT(DISTINCT blogger_handle) AS unique_bloggers, MAX(created_at) AS last_activity
-                FROM analyses GROUP BY manager ORDER BY total_analyses DESC
-            """).fetchall()
-            return [dict(r) for r in rows]
+        with get_db_connection() as conn:
+            with conn.cursor(cursor_factory=RealDictCursor) as cur:
+                cur.execute("""
+                    SELECT manager, COUNT(*) AS total_analyses, COUNT(DISTINCT blogger_handle) AS unique_bloggers, MAX(created_at) AS last_activity
+                    FROM analyses GROUP BY manager ORDER BY total_analyses DESC
+                """)
+                return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
 
 def delete_analysis(analysis_id):
     try:
-        with db_connect() as conn:
-            conn.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
+        with get_db_connection() as conn:
+            with conn.cursor() as cur:
+                cur.execute("DELETE FROM analyses WHERE id = %s", (analysis_id,))
         return True
     except Exception:
         return False
@@ -1165,15 +987,55 @@ else:
 
             starter_catalog = STARTER_MODEL_CATALOG if provider_mode_input == "openrouter" else GEMINI_STARTER_CATALOG
             model_catalog = st.session_state.available_models or starter_catalog
+            
+            # --- БЛОК ТЕСТИРОВАНИЯ ИИ ---
+            testable_all = [m for m in model_catalog if looks_like_chat_model(m["id"])]
+            max_models_to_test_input = st.sidebar.number_input(
+                "Сколько моделей проверять за раз", min_value=1, max_value=max(len(testable_all), 1),
+                value=min(st.session_state.cfg_max_models_to_test, max(len(testable_all), 1)), step=1,
+            )
+            testable = testable_all[:max_models_to_test_input]
+            
+            if st.sidebar.button(f"🧪 Проверить, какие модели реально работают ({len(testable)})", use_container_width=True):
+                progress = st.sidebar.progress(0.0, text="Начинаю проверку...")
+                results = dict(st.session_state.model_test_results)
+                for i, m in enumerate(testable):
+                    progress.progress(i / max(len(testable), 1), text=f"Проверяю {m['id']} ({i + 1}/{len(testable)})...")
+                    results[m["id"]] = test_single_model(provider_mode_input, ai_base_url_input, ai_key_input, m["id"])
+                    time.sleep(2.5)
+                progress.progress(1.0, text="Готово!")
+                st.session_state.model_test_results = results
+                st.session_state.cfg_max_models_to_test = max_models_to_test_input
+                ok_count = sum(1 for r in results.values() if r["score"] == 100)
+                st.sidebar.success(f"Проверено {len(testable)} моделей — полностью рабочих: {ok_count}")
+            # --- КОНЕЦ БЛОКА ТЕСТИРОВАНИЯ ИИ ---
 
-            model_choices = [MANUAL_MODEL_OPTION] + model_catalog
+            hide_broken = st.sidebar.checkbox(
+                "Показывать в списке только проверенные рабочие (100%)", value=False,
+            )
+
+            def _model_score(model_id):
+                r = st.session_state.model_test_results.get(model_id)
+                return r["score"] if r else -1
+
+            display_catalog = sorted(model_catalog, key=lambda m: (-_model_score(m["id"]), m["is_free"] is not True, m["id"]))
+            if hide_broken:
+                display_catalog = [m for m in display_catalog if _model_score(m["id"]) == 100]
+
+            model_choices = [MANUAL_MODEL_OPTION] + display_catalog
             current_ids = [m["id"] for m in model_choices]
             default_index = current_ids.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in current_ids else 0
 
             def _format_model_option(m):
                 if m["id"] == "__manual__": return m["name"]
                 free_icon = '🆓' if m['is_free'] is True else ('💰' if m['is_free'] is False else '•')
-                return f"{free_icon} {m['id']}"
+                test_result = st.session_state.model_test_results.get(m["id"])
+                if test_result:
+                    score = test_result["score"]
+                    test_icon = f"✅{score}%" if score == 100 else (f"⚠️{score}%" if score == 50 else f"❌{score}%")
+                else:
+                    test_icon = "…"
+                return f"{free_icon} {test_icon} {m['id']}"
 
             selected_model_entry = st.sidebar.selectbox("Модель", model_choices, index=default_index, format_func=_format_model_option)
             if selected_model_entry["id"] == "__manual__":
