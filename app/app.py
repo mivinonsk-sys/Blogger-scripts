@@ -1,6 +1,12 @@
-# pip install streamlit openai pandas psycopg2-binary
+# requirements.txt:
+# streamlit
+# openai
+# anthropic
+# pandas
+# httpx
+# psycopg2-binary
 #
-# Запуск: streamlit run blogger_reels_analyzer.py
+# Запуск локально: streamlit run blogger_reels_analyzer.py
 
 import json
 import time
@@ -208,76 +214,117 @@ try {{
 
 # ============================================================================
 # ХРАНИЛИЩЕ ДАННЫХ (PostgreSQL / Supabase)
+#
+# ВАЖНО про строку подключения:
+# Прямой адрес Supabase (db.xxxxx.supabase.co) работает только по IPv6,
+# а Streamlit Cloud — по IPv4. Используйте строку ПУЛЕРА:
+#   postgresql://postgres.ВАШПРОЕКТ:ПАРОЛЬ@aws-0-РЕГИОН.pooler.supabase.com:5432/postgres
+# В Supabase: кнопка Connect → вкладка "Session pooler".
+#
+# Секрет в Streamlit Cloud (Settings → Secrets), ровно в таком виде:
+#   [postgres]
+#   url = "postgresql://..."
 # ============================================================================
 
+@st.cache_resource
+def _create_connection():
+    """Создаёт одно соединение на всё приложение (кэшируется Streamlit)."""
+    db_url = st.secrets["postgres"]["url"]
+    conn = psycopg2.connect(db_url, connect_timeout=10, sslmode="require")
+    conn.autocommit = True
+    return conn
+
+
 def get_db_connection():
-    """Подключение к PostgreSQL через секреты Streamlit"""
+    """Возвращает живое соединение. Если кэшированное оборвалось (Supabase
+    закрывает неактивные) — пересоздаёт его, а не падает с ошибкой."""
     try:
-        # Пытаемся получить URL из секретов
-        db_url = st.secrets["postgres"]["url"]
-        conn = psycopg2.connect(db_url)
-        conn.autocommit = True  # Для простоты транзакций как в SQLite
+        conn = _create_connection()
+        # быстрая проверка живости
+        if conn.closed:
+            raise psycopg2.OperationalError("connection closed")
+        with conn.cursor() as cur:
+            cur.execute("SELECT 1")
         return conn
-    except Exception as e:
-        st.error("🚨 Ошибка подключения к базе данных! Проверьте секреты в Streamlit Cloud.")
+    except KeyError:
+        st.error(
+            "🚨 Не найден секрет [postgres] → url. "
+            "Откройте Settings → Secrets в Streamlit Cloud и добавьте:\n\n"
+            '[postgres]\nurl = "postgresql://..."'
+        )
         st.stop()
+    except Exception as first_error:
+        # пробуем переподключиться один раз
+        try:
+            _create_connection.clear()
+            conn = _create_connection()
+            with conn.cursor() as cur:
+                cur.execute("SELECT 1")
+            return conn
+        except Exception as e:
+            st.error(f"🚨 Ошибка подключения к базе: {type(e).__name__}: {e}")
+            st.caption(
+                "Частая причина: используется прямая строка db.xxxxx.supabase.co (только IPv6). "
+                "Возьмите строку Session pooler — в ней есть pooler.supabase.com."
+            )
+            st.stop()
+
 
 def init_db():
-    with get_db_connection() as conn:
-        with conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS analyses (
-                    id SERIAL PRIMARY KEY,
-                    manager TEXT NOT NULL,
-                    blogger_url TEXT NOT NULL,
-                    blogger_handle TEXT,
-                    created_at TEXT NOT NULL,
-                    data_source TEXT,
-                    model_used TEXT,
-                    reels_count INTEGER,
-                    median_views INTEGER,
-                    viral_count INTEGER,
-                    product_brief TEXT,
-                    metrics_json TEXT,
-                    top_viral_json TEXT,
-                    result_json TEXT
+    conn = get_db_connection()
+    with conn.cursor(cursor_factory=RealDictCursor) as cur:
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS analyses (
+                id SERIAL PRIMARY KEY,
+                manager TEXT NOT NULL,
+                blogger_url TEXT NOT NULL,
+                blogger_handle TEXT,
+                created_at TEXT NOT NULL,
+                data_source TEXT,
+                model_used TEXT,
+                reels_count INTEGER,
+                median_views INTEGER,
+                viral_count INTEGER,
+                product_brief TEXT,
+                metrics_json TEXT,
+                top_viral_json TEXT,
+                result_json TEXT
+            )
+        """)
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
+        cur.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS managers (
+                id SERIAL PRIMARY KEY,
+                name TEXT NOT NULL UNIQUE,
+                password_hash TEXT,
+                salt TEXT,
+                is_active INTEGER NOT NULL DEFAULT 1,
+                created_at TEXT NOT NULL
+            )
+        """)
+        cur.execute("""
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            )
+        """)
+        cur.execute("SELECT COUNT(*) AS c FROM managers")
+        if cur.fetchone()["c"] == 0:
+            seed = [
+                "Анастасия Виницкая", "Андрей Колмагоров", "Диана Комисарова",
+                "Екатерина Гантимурова", "Екатерина Зиновьева", "Катерина Запара",
+                "Марина Казьмина", "Марина Капитанова", "Оксана Шульга",
+                "Ольга Ребреева", "Юлия Ильина",
+            ]
+            now = datetime.now().isoformat(timespec="seconds")
+            for n in seed:
+                cur.execute(
+                    "INSERT INTO managers (name, password_hash, salt, is_active, created_at) "
+                    "VALUES (%s, NULL, NULL, 1, %s) ON CONFLICT (name) DO NOTHING",
+                    (n, now)
                 )
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
-            
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS managers (
-                    id SERIAL PRIMARY KEY,
-                    name TEXT NOT NULL UNIQUE,
-                    password_hash TEXT,
-                    salt TEXT,
-                    is_active INTEGER NOT NULL DEFAULT 1,
-                    created_at TEXT NOT NULL
-                )
-            """)
-            cur.execute("""
-                CREATE TABLE IF NOT EXISTS app_settings (
-                    key TEXT PRIMARY KEY,
-                    value TEXT
-                )
-            """)
-            
-            cur.execute("SELECT COUNT(*) AS c FROM managers")
-            existing = cur.fetchone()["c"]
-            if existing == 0:
-                seed = [
-                    "Анастасия Виницкая", "Андрей Колмагоров", "Диана Комисарова",
-                    "Екатерина Гантимурова", "Екатерина Зиновьева", "Катерина Запара",
-                    "Марина Казьмина", "Марина Капитанова", "Оксана Шульга",
-                    "Ольга Ребреева", "Юлия Ильина",
-                ]
-                now = datetime.now().isoformat(timespec="seconds")
-                for n in seed:
-                    cur.execute(
-                        "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (%s, NULL, NULL, 1, %s) ON CONFLICT DO NOTHING",
-                        (n, now)
-                    )
+
 
 def hash_password(password: str, salt: str = None):
     if salt is None:
@@ -285,138 +332,227 @@ def hash_password(password: str, salt: str = None):
     dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 200_000)
     return dk.hex(), salt
 
+
 def verify_password(password: str, password_hash: str, salt: str) -> bool:
     if not password_hash or not salt:
         return True
     candidate, _ = hash_password(password, salt)
     return secrets.compare_digest(candidate, password_hash)
 
+
 def get_managers(active_only=True):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                q = "SELECT * FROM managers"
-                if active_only: q += " WHERE is_active = 1"
-                q += " ORDER BY name"
-                cur.execute(q)
-                return [dict(r) for r in cur.fetchall()]
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            q = "SELECT * FROM managers"
+            if active_only:
+                q += " WHERE is_active = 1"
+            q += " ORDER BY name"
+            cur.execute(q)
+            return [dict(r) for r in cur.fetchall()]
     except Exception:
         return []
 
+
 def get_manager(name):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT * FROM managers WHERE name = %s", (name,))
-                row = cur.fetchone()
-                return dict(row) if row else None
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT * FROM managers WHERE name = %s", (name,))
+            row = cur.fetchone()
+            return dict(row) if row else None
     except Exception:
         return None
 
+
 def add_manager(name, password=None):
     name = (name or "").strip()
-    if not name: return False, "Имя не может быть пустым."
-    if len(name) > 100: return False, "Имя слишком длинное."
+    if not name:
+        return False, "Имя не может быть пустым."
+    if len(name) > 100:
+        return False, "Имя слишком длинное."
     try:
         pw_hash, salt = hash_password(password) if password else (None, None)
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (%s, %s, %s, 1, %s)",
-                    (name, pw_hash, salt, datetime.now().isoformat(timespec="seconds")),
-                )
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (%s, %s, %s, 1, %s)",
+                (name, pw_hash, salt, datetime.now().isoformat(timespec="seconds")),
+            )
         return True, f"Менеджер «{name}» добавлен."
     except psycopg2.IntegrityError:
         return False, f"Менеджер «{name}» уже существует."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
+
 def set_manager_password(name, password):
     try:
         pw_hash, salt = hash_password(password) if password else (None, None)
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE managers SET password_hash = %s, salt = %s WHERE name = %s", (pw_hash, salt, name))
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE managers SET password_hash = %s, salt = %s WHERE name = %s", (pw_hash, salt, name))
         return True, ("PIN установлен." if password else "PIN снят — вход без PIN.")
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
+
 def rename_manager(old_name, new_name):
     new_name = (new_name or "").strip()
-    if not new_name: return False, "Новое имя не может быть пустым."
+    if not new_name:
+        return False, "Новое имя не может быть пустым."
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("UPDATE managers SET name = %s WHERE name = %s", (new_name, old_name))
-                cur.execute("UPDATE analyses SET manager = %s WHERE manager = %s", (new_name, old_name))
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("UPDATE managers SET name = %s WHERE name = %s", (new_name, old_name))
+            cur.execute("UPDATE analyses SET manager = %s WHERE manager = %s", (new_name, old_name))
         return True, f"Переименован: «{old_name}» → «{new_name}»."
     except psycopg2.IntegrityError:
         return False, f"Менеджер «{new_name}» уже существует."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
+
 def delete_manager(name, delete_history=False):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM managers WHERE name = %s", (name,))
-                if delete_history:
-                    cur.execute("DELETE FROM analyses WHERE manager = %s", (name,))
-        return True, "Менеджер удален."
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM managers WHERE name = %s", (name,))
+            if delete_history:
+                cur.execute("DELETE FROM analyses WHERE manager = %s", (name,))
+        return True, "Менеджер удалён."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
 
+
 def count_manager_analyses(name):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT COUNT(*) AS c FROM analyses WHERE manager = %s", (name,))
-                return cur.fetchone()["c"]
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT COUNT(*) AS c FROM analyses WHERE manager = %s", (name,))
+            return cur.fetchone()["c"]
     except Exception:
         return 0
 
+
 def get_setting(key, default=None):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
-                row = cur.fetchone()
-                return row["value"] if row else default
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("SELECT value FROM app_settings WHERE key = %s", (key,))
+            row = cur.fetchone()
+            return row["value"] if row else default
     except Exception:
         return default
 
+
 def set_setting(key, value):
     try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
-                    "ON CONFLICT(key) DO UPDATE SET value = EXCLUDED.value",
-                    (key, str(value)),
-                )
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO app_settings (key, value) VALUES (%s, %s) "
+                "ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+                (key, str(value)),
+            )
         return True
     except Exception as e:
-        print(e)
+        print(f"set_setting error: {e}")
         return False
+
 
 def load_setting_str(key, default=""):
     val = get_setting(key)
     return val if val is not None else default
 
+
 def load_setting_int(key, default=0):
     val = get_setting(key)
-    return int(val) if val is not None else default
+    try:
+        return int(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
 
 def load_setting_float(key, default=0.0):
     val = get_setting(key)
-    return float(val) if val is not None else default
+    try:
+        return float(val) if val is not None else default
+    except (TypeError, ValueError):
+        return default
+
 
 def load_setting_bool(key, default=False):
     val = get_setting(key)
     return val == "True" if val is not None else default
 
 
+def save_analysis(manager, blogger_url, blogger_handle, data_source, model_used,
+                  reels_count, median_views, viral_count, product_brief,
+                  metrics_df, top_viral_df, result):
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                INSERT INTO analyses (manager, blogger_url, blogger_handle, created_at, data_source,
+                                      model_used, reels_count, median_views, viral_count, product_brief,
+                                      metrics_json, top_viral_json, result_json)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
+            """, (
+                manager, blogger_url, blogger_handle, datetime.now().isoformat(timespec="seconds"),
+                data_source, model_used, int(reels_count), int(median_views), int(viral_count),
+                product_brief,
+                metrics_df.to_json(orient="records", force_ascii=False) if metrics_df is not None else "[]",
+                top_viral_df.to_json(orient="records", force_ascii=False) if top_viral_df is not None else "[]",
+                json.dumps(result, ensure_ascii=False),
+            ))
+            return cur.fetchone()["id"]
+    except Exception as e:
+        print(f"save_analysis error: {e}")
+        return None
+
+
+def get_analyses(manager=None, limit=500):
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            if manager:
+                cur.execute("SELECT * FROM analyses WHERE manager = %s ORDER BY created_at DESC LIMIT %s", (manager, limit))
+            else:
+                cur.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT %s", (limit,))
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def get_manager_stats():
+    try:
+        conn = get_db_connection()
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            cur.execute("""
+                SELECT manager, COUNT(*) AS total_analyses,
+                       COUNT(DISTINCT blogger_handle) AS unique_bloggers,
+                       MAX(created_at) AS last_activity
+                FROM analyses GROUP BY manager ORDER BY total_analyses DESC
+            """)
+            return [dict(r) for r in cur.fetchall()]
+    except Exception:
+        return []
+
+
+def delete_analysis(analysis_id):
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cur:
+            cur.execute("DELETE FROM analyses WHERE id = %s", (analysis_id,))
+        return True
+    except Exception:
+        return False
+
+
 ADMIN_PIN_DEFAULT = "0000"
+
+
 def verify_admin_pin(pin: str) -> bool:
     stored_hash = get_setting("admin_pin_hash")
     stored_salt = get_setting("admin_pin_salt")
@@ -425,16 +561,18 @@ def verify_admin_pin(pin: str) -> bool:
     candidate, _ = hash_password(pin, stored_salt)
     return secrets.compare_digest(candidate, stored_hash)
 
+
 def set_admin_pin(new_pin: str):
     pin_hash, salt = hash_password(new_pin)
     ok = set_setting("admin_pin_hash", pin_hash) and set_setting("admin_pin_salt", salt)
     return (True, "PIN администратора изменён.") if ok else (False, "Не удалось сохранить PIN.")
 
+
 def admin_pin_is_default() -> bool:
     return not (get_setting("admin_pin_hash") and get_setting("admin_pin_salt"))
 
 # ============================================================================
-# ИНИЦИАЛИЗАЦИЯ СОСТОЯНИЯ ИЗ БАЗЫ ДАННЫХ
+# ТЕКСТЫ ПО УМОЛЧАНИЮ
 # ============================================================================
 DEFAULT_BRIEF_TEXT = (
     "Товар: утягивающие майки (женское корректирующее бельё/топы).\n"
@@ -493,7 +631,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "}"
 )
 
-# Инициализируем Postgres таблицы
+# Создаём таблицы в Postgres (при первом запуске)
 init_db()
 
 if "admin_logged_in" not in st.session_state:
@@ -502,26 +640,26 @@ if "admin_logged_in" not in st.session_state:
 if "manager_logged_in" not in st.session_state:
     st.session_state.manager_logged_in = None
 
-# Загружаем настройки 1 раз при старте
+# Загружаем настройки из базы один раз за сессию
 if "settings_loaded" not in st.session_state:
     st.session_state.cfg_ai_provider_mode = load_setting_str("cfg_ai_provider_mode", "openrouter")
     st.session_state.cfg_ai_base_url = load_setting_str("cfg_ai_base_url", "https://openrouter.ai/api/v1")
     st.session_state.cfg_ai_key = load_setting_str("cfg_ai_key", "")
     st.session_state.cfg_ai_model = load_setting_str("cfg_ai_model", "anthropic/claude-sonnet-5")
     st.session_state.cfg_max_tokens = load_setting_int("cfg_max_tokens", 3000)
-    
+
     st.session_state.cfg_data_source_mode = load_setting_str("cfg_data_source_mode", "apify")
     st.session_state.cfg_apify_token = load_setting_str("cfg_apify_token", "")
     st.session_state.cfg_apify_actor = load_setting_str("cfg_apify_actor", "apify/instagram-reel-scraper")
     st.session_state.cfg_results_limit = load_setting_int("cfg_results_limit", 25)
     st.session_state.cfg_lookback_days = load_setting_int("cfg_lookback_days", 30)
     st.session_state.cfg_include_transcript = load_setting_bool("cfg_include_transcript", True)
-    
+
     st.session_state.cfg_viral_threshold = load_setting_float("cfg_viral_threshold", 2.5)
     st.session_state.cfg_top_n_viral = load_setting_int("cfg_top_n_viral", 3)
     st.session_state.min_reels_required = load_setting_int("min_reels_required", 8)
     st.session_state.scenarios_count = load_setting_int("scenarios_count", 4)
-    
+
     st.session_state.product_brief_default = load_setting_str("product_brief_default", DEFAULT_BRIEF_TEXT)
     st.session_state.system_prompt_cfg = load_setting_str("system_prompt_cfg", DEFAULT_SYSTEM_PROMPT)
 
@@ -547,6 +685,16 @@ GEMINI_STARTER_CATALOG = [
     {"id": "gemini-2.5-flash", "name": "Gemini 2.5 Flash", "is_free": True, "context_length": 1000000},
     {"id": "gemini-2.5-flash-lite", "name": "Gemini 2.5 Flash Lite", "is_free": True, "context_length": 1000000},
 ]
+
+
+def strip_json_fences(text: str) -> str:
+    text = text.strip()
+    if text.startswith('`' * 3):
+        text = text.split("\n", 1)[1] if "\n" in text else text
+        if text.rstrip().endswith('`' * 3):
+            text = text.rstrip()[:-3]
+    return text.strip()
+
 
 def fetch_openai_compatible_models(base_url: str, api_key: str):
     if httpx is None:
@@ -576,11 +724,15 @@ def fetch_openai_compatible_models(base_url: str, api_key: str):
     parsed.sort(key=lambda x: (x["is_free"] is not True, x["id"]))
     return parsed
 
+
 def guess_gemini_free_tier(model_id: str):
     text = model_id.lower()
-    if "pro" in text: return False
-    if "flash" in text or "lite" in text: return True
+    if "pro" in text:
+        return False
+    if "flash" in text or "lite" in text:
+        return True
     return None
+
 
 def apply_gemini_free_tier_guess(model_list):
     updated = []
@@ -592,17 +744,21 @@ def apply_gemini_free_tier_guess(model_list):
     updated.sort(key=lambda x: (x["is_free"] is not True, x["id"]))
     return updated
 
+
 NON_CHAT_MODEL_HINTS = ["embedding", "embed-", "-tts", "imagen", "veo-", "aqa", "text-embedding", "-image"]
+
 
 def looks_like_chat_model(model_id: str) -> bool:
     text = model_id.lower()
     return not any(hint in text for hint in NON_CHAT_MODEL_HINTS)
+
 
 TEST_SYSTEM_PROMPT = (
     "Ты обязан отвечать СТРОГО валидным JSON без markdown-разметки и без пояснений до или после. "
     'Схема: {"status": "ok", "patterns": [{"pattern": "строка"}], "scenarios": [{"title": "строка"}]}'
 )
 TEST_USER_PROMPT = "Верни тестовый ответ строго по указанной JSON-схеме: один элемент в patterns, один в scenarios, любые короткие значения полей."
+
 
 def call_chat_completion(client, model, messages, max_tokens, provider_mode):
     if provider_mode == "gemini":
@@ -618,10 +774,13 @@ def call_chat_completion(client, model, messages, max_tokens, provider_mode):
             raise
     return client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages)
 
+
 def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
+    """Реальный мини-запрос: отвечает ли модель и держит ли строгий JSON."""
     try:
         if provider_mode == "anthropic_direct":
-            if Anthropic is None: return {"score": 0, "detail": "библиотека anthropic не установлена"}
+            if Anthropic is None:
+                return {"score": 0, "detail": "библиотека anthropic не установлена"}
             client = Anthropic(api_key=api_key)
             response = client.messages.create(
                 model=model_id, max_tokens=300, system=TEST_SYSTEM_PROMPT,
@@ -629,7 +788,8 @@ def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
             )
             raw_text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         else:
-            if OpenAI is None: return {"score": 0, "detail": "библиотека openai не установлена"}
+            if OpenAI is None:
+                return {"score": 0, "detail": "библиотека openai не установлена"}
             client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
             response = call_chat_completion(
                 client, model_id,
@@ -643,6 +803,8 @@ def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
             return {"score": 0, "detail": "лимит запросов (429) — попробуйте позже"}
         return {"score": 0, "detail": f"{type(exc).__name__}: {msg[:180]}"}
 
+    if not raw_text.strip():
+        return {"score": 0, "detail": "вернула пустой ответ (весь лимит ушёл на «мышление»)"}
     try:
         parsed = json.loads(strip_json_fences(raw_text))
         if isinstance(parsed, dict) and "patterns" in parsed and "scenarios" in parsed:
@@ -664,6 +826,7 @@ if "reels_data" not in st.session_state:
           "Транскрипция (если есть)": ""} for _ in range(6)]
     )
 
+
 def build_test_dataframe():
     rows = [
         ("instagram.com/reel/demo1", 210000, 15200, 810, 4100, "2026-05-02", "Примерка нескольких образов подряд под трендовый звук", ""),
@@ -672,24 +835,31 @@ def build_test_dataframe():
     ]
     return pd.DataFrame(rows, columns=REELS_COLUMNS)
 
+
 def apify_get_first(item: dict, keys, default=""):
     for k in keys:
         val = item.get(k)
-        if val not in (None, ""): return val
+        if val not in (None, ""):
+            return val
     return default
 
+
 def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_days=None,
-                           include_transcript=False, skip_pinned=True, skip_trial=True, timeout=300):
-    if httpx is None: raise RuntimeError("Библиотека httpx не установлена")
+                          include_transcript=False, skip_pinned=True, skip_trial=True, timeout=300):
+    if httpx is None:
+        raise RuntimeError("Библиотека httpx не установлена")
     actor_path = actor.strip("/").replace("/", "~")
     url = f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items?token={token}"
     body = {"username": targets, "skipPinnedPosts": skip_pinned, "skipTrialReels": skip_trial, "includeTranscript": include_transcript}
-    if results_limit: body["resultsLimit"] = results_limit
-    if lookback_days: body["onlyPostsNewerThan"] = f"{lookback_days} days"
+    if results_limit:
+        body["resultsLimit"] = results_limit
+    if lookback_days:
+        body["onlyPostsNewerThan"] = f"{lookback_days} days"
     resp = httpx.post(url, json=body, timeout=timeout)
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, list) else data.get("items", [])
+
 
 def apify_items_to_dataframe(items):
     rows = []
@@ -709,13 +879,6 @@ def apify_items_to_dataframe(items):
         })
     return pd.DataFrame(rows, columns=REELS_COLUMNS) if rows else pd.DataFrame(columns=REELS_COLUMNS)
 
-def strip_json_fences(text: str) -> str:
-    text = text.strip()
-    if text.startswith('`' * 3):
-        text = text.split("\n", 1)[1] if "\n" in text else text
-        if text.rstrip().endswith('`' * 3):
-            text = text.rstrip()[:-3]
-    return text.strip()
 
 def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
     clean = df.copy()
@@ -728,10 +891,13 @@ def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
     median_views = statistics.median(valid_views) if valid_views else 0
 
     def er_pct(row):
-        if row["Просмотры"] <= 0: return 0.0
+        if row["Просмотры"] <= 0:
+            return 0.0
         return round((row["Лайки"] + row["Комментарии"] + row["Сохранения"]) / row["Просмотры"] * 100, 2)
+
     def perf_index(row):
-        if median_views <= 0 or row["Просмотры"] <= 0: return None
+        if median_views <= 0 or row["Просмотры"] <= 0:
+            return None
         return round(row["Просмотры"] / median_views, 2)
 
     clean["ER_%"] = clean.apply(er_pct, axis=1)
@@ -739,12 +905,14 @@ def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
     clean["Аномалия"] = clean["Индекс_к_медиане"].apply(lambda x: bool(x and x >= viral_threshold))
     return clean, median_views
 
+
 def select_top_viral(metrics_df: pd.DataFrame, threshold: float, top_n: int):
     qualifying = metrics_df[metrics_df["Индекс_к_медиане"].apply(lambda x: bool(x and x >= threshold))]
     qualifying = qualifying.sort_values("Индекс_к_медиане", ascending=False)
     if qualifying.empty:
         return metrics_df.sort_values("Просмотры", ascending=False).head(top_n), False
     return qualifying.head(top_n), True
+
 
 def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df=None):
     table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
@@ -762,16 +930,18 @@ def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_sc
         f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}"
     )
 
+
 def fallback_result(reason: str):
     return {
         "audience_summary": f"Не удалось получить ответ от ИИ ({reason}). Ниже — заглушка.",
         "patterns": [{"pattern": "Заглушка", "evidence": "демо", "strength": "предварительная"}],
-        "scenarios": [{"title": "Демо-сценарий", "based_on_pattern": "—", "hook": "Настройте API-ключ OpenRouter", "script": "—", "caption": "—", "ad_marking_note": "Реклама.", "fit_score": "средний"}],
+        "scenarios": [{"title": "Демо-сценарий", "based_on_pattern": "—", "hook": "Настройте API-ключ в панели администратора", "script": "—", "caption": "—", "ad_marking_note": "Реклама.", "fit_score": "средний"}],
         "verdict_note": "Заполните ключ ИИ-помощника в настройках.",
     }
 
 
 PIN_LENGTH = 4
+
 
 def render_pin_pad(form_key: str, title: str, subtitle: str):
     st.markdown(f"""
@@ -788,6 +958,7 @@ def render_pin_pad(form_key: str, title: str, subtitle: str):
             st.markdown('</div>', unsafe_allow_html=True)
             submitted = st.form_submit_button("🔓 Войти", use_container_width=True, type="primary")
     return submitted, (pin_value or "").strip()
+
 
 def play_success_animation(message="Доступ разрешён"):
     components.html(f"""
@@ -824,65 +995,6 @@ def play_success_animation(message="Доступ разрешён"):
     </script>
     """, height=240)
 
-
-def save_analysis(manager, blogger_url, blogger_handle, data_source, model_used,
-                  reels_count, median_views, viral_count, product_brief,
-                  metrics_df, top_viral_df, result):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    INSERT INTO analyses (manager, blogger_url, blogger_handle, created_at, data_source,
-                                          model_used, reels_count, median_views, viral_count, product_brief,
-                                          metrics_json, top_viral_json, result_json)
-                    VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id
-                """, (
-                    manager, blogger_url, blogger_handle, datetime.now().isoformat(timespec="seconds"),
-                    data_source, model_used, int(reels_count), int(median_views), int(viral_count),
-                    product_brief,
-                    metrics_df.to_json(orient="records", force_ascii=False) if metrics_df is not None else "[]",
-                    top_viral_df.to_json(orient="records", force_ascii=False) if top_viral_df is not None else "[]",
-                    json.dumps(result, ensure_ascii=False),
-                ))
-                return cur.fetchone()["id"]
-    except Exception as e:
-        print(f"Error saving analysis: {e}")
-        return None
-
-def get_analyses(manager=None, limit=500):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                if manager:
-                    cur.execute("SELECT * FROM analyses WHERE manager = %s ORDER BY created_at DESC LIMIT %s", (manager, limit))
-                else:
-                    cur.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT %s", (limit,))
-                return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
-
-def get_manager_stats():
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor(cursor_factory=RealDictCursor) as cur:
-                cur.execute("""
-                    SELECT manager, COUNT(*) AS total_analyses, COUNT(DISTINCT blogger_handle) AS unique_bloggers, MAX(created_at) AS last_activity
-                    FROM analyses GROUP BY manager ORDER BY total_analyses DESC
-                """)
-                return [dict(r) for r in cur.fetchall()]
-    except Exception:
-        return []
-
-def delete_analysis(analysis_id):
-    try:
-        with get_db_connection() as conn:
-            with conn.cursor() as cur:
-                cur.execute("DELETE FROM analyses WHERE id = %s", (analysis_id,))
-        return True
-    except Exception:
-        return False
-
-
 # ============================================================================
 # ШАПКА И АВТОРИЗАЦИЯ
 # ============================================================================
@@ -899,13 +1011,15 @@ with top_col2:
 if selected_manager == "👑 Администратор" and not st.session_state.admin_logged_in:
     submitted, entered_pin = render_pin_pad("admin_pin_form", "Вход администратора", f"Введите {PIN_LENGTH}-значный PIN.")
     if submitted:
-        if len(entered_pin) < PIN_LENGTH: st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
+        if len(entered_pin) < PIN_LENGTH:
+            st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
         elif verify_admin_pin(entered_pin):
             play_success_animation("Доступ разрешён")
             time.sleep(2.9)
             st.session_state.admin_logged_in = True
             st.rerun()
-        else: st.error("Неверный PIN! Попробуйте ещё раз.")
+        else:
+            st.error("Неверный PIN! Попробуйте ещё раз.")
 
 elif selected_manager == "Выберите пользователя...":
     st.session_state.admin_logged_in = False
@@ -922,16 +1036,18 @@ elif (selected_manager != "👑 Администратор"
       and (get_manager(selected_manager) or {}).get("password_hash")
       and st.session_state.get("manager_logged_in") != selected_manager):
     st.session_state.admin_logged_in = False
-    submitted, entered_pin = render_pin_pad("manager_pin_form", f"Вход: {html.escape(selected_manager)}", f"Для этого пользователя администратор задал {PIN_LENGTH}-значный PIN.")
+    submitted, entered_pin = render_pin_pad("manager_pin_form", f"Вход: {selected_manager}", f"Для этого пользователя администратор задал {PIN_LENGTH}-значный PIN.")
     if submitted:
         mrec = get_manager(selected_manager) or {}
-        if len(entered_pin) < PIN_LENGTH: st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
+        if len(entered_pin) < PIN_LENGTH:
+            st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
         elif verify_password(entered_pin, mrec.get("password_hash"), mrec.get("salt")):
             play_success_animation("Доступ разрешён")
             time.sleep(2.9)
             st.session_state.manager_logged_in = selected_manager
             st.rerun()
-        else: st.error("Неверный PIN! Попробуйте ещё раз.")
+        else:
+            st.error("Неверный PIN! Попробуйте ещё раз.")
 
 else:
     if selected_manager != "👑 Администратор":
@@ -952,9 +1068,9 @@ else:
         st.session_state.admin_logged_in = False
         st.rerun()
 
-    # ============================================================================
-    # БОКОВАЯ ПАНЕЛЬ С ГЛОБАЛЬНЫМ СОХРАНЕНИЕМ (ДЛЯ АДМИНА)
-    # ============================================================================
+    # ========================================================================
+    # БОКОВАЯ ПАНЕЛЬ (НАСТРОЙКИ АДМИНА, СОХРАНЯЮТСЯ ГЛОБАЛЬНО В БАЗУ)
+    # ========================================================================
     st.sidebar.markdown("### <i class='fa-solid fa-key'></i> Настройки ИИ-помощника", unsafe_allow_html=True)
 
     if is_admin:
@@ -963,23 +1079,31 @@ else:
             "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_label": "API-ключ (OpenRouter)", "key_help": "openrouter.ai/workspaces/default/keys"},
             "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "key_label": "API-ключ (Google AI Studio / Gemini)", "key_help": "aistudio.google.com/api-keys"},
         }
-        provider_mode_input = st.sidebar.selectbox("Способ вызова ИИ", list(provider_mode_labels.keys()), index=list(provider_mode_labels.keys()).index(st.session_state.cfg_ai_provider_mode), format_func=lambda k: provider_mode_labels[k])
+        provider_mode_input = st.sidebar.selectbox(
+            "Способ вызова ИИ", list(provider_mode_labels.keys()),
+            index=list(provider_mode_labels.keys()).index(st.session_state.cfg_ai_provider_mode),
+            format_func=lambda k: provider_mode_labels[k],
+        )
 
         if provider_mode_input == "anthropic_direct":
             ai_key_input = st.sidebar.text_input("API-ключ Anthropic", value=st.session_state.cfg_ai_key, type="password")
             direct_model_options = ["claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-fable-5"]
-            ai_model_input = st.sidebar.selectbox("Модель", direct_model_options, index=direct_model_options.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in direct_model_options else 0)
+            ai_model_input = st.sidebar.selectbox(
+                "Модель", direct_model_options,
+                index=direct_model_options.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in direct_model_options else 0,
+            )
             ai_base_url_input = "https://api.anthropic.com"
         else:
             preset = provider_presets[provider_mode_input]
             default_base_url = st.session_state.cfg_ai_base_url if st.session_state.cfg_ai_provider_mode == provider_mode_input else preset["base_url"]
             ai_base_url_input = st.sidebar.text_input("Base URL API", value=default_base_url, help=f"По умолчанию: {preset['base_url']}")
             ai_key_input = st.sidebar.text_input(preset["key_label"], value=st.session_state.cfg_ai_key, type="password", help=preset["key_help"])
-            
+
             if st.sidebar.button(f"🔄 Обновить список моделей ({provider_mode_labels[provider_mode_input]})", use_container_width=True):
                 try:
                     fetched = fetch_openai_compatible_models(ai_base_url_input, ai_key_input)
-                    if provider_mode_input == "gemini": fetched = apply_gemini_free_tier_guess(fetched)
+                    if provider_mode_input == "gemini":
+                        fetched = apply_gemini_free_tier_guess(fetched)
                     st.session_state.available_models = fetched
                     st.sidebar.success(f"Загружено моделей: {len(st.session_state.available_models)}")
                 except Exception as exc:
@@ -987,15 +1111,18 @@ else:
 
             starter_catalog = STARTER_MODEL_CATALOG if provider_mode_input == "openrouter" else GEMINI_STARTER_CATALOG
             model_catalog = st.session_state.available_models or starter_catalog
-            
-            # --- БЛОК ТЕСТИРОВАНИЯ ИИ ---
+
+            # ---------- БЛОК ТЕСТИРОВАНИЯ МОДЕЛЕЙ ----------
             testable_all = [m for m in model_catalog if looks_like_chat_model(m["id"])]
             max_models_to_test_input = st.sidebar.number_input(
                 "Сколько моделей проверять за раз", min_value=1, max_value=max(len(testable_all), 1),
                 value=min(st.session_state.cfg_max_models_to_test, max(len(testable_all), 1)), step=1,
+                help="Каждая проверка — реальный запрос к модели (время + лимиты). Доступно для проверки: " + str(len(testable_all)),
             )
             testable = testable_all[:max_models_to_test_input]
-            
+            if len(testable_all) > max_models_to_test_input:
+                st.sidebar.caption(f"Проверю первые {max_models_to_test_input} из {len(testable_all)}.")
+
             if st.sidebar.button(f"🧪 Проверить, какие модели реально работают ({len(testable)})", use_container_width=True):
                 progress = st.sidebar.progress(0.0, text="Начинаю проверку...")
                 results = dict(st.session_state.model_test_results)
@@ -1008,10 +1135,10 @@ else:
                 st.session_state.cfg_max_models_to_test = max_models_to_test_input
                 ok_count = sum(1 for r in results.values() if r["score"] == 100)
                 st.sidebar.success(f"Проверено {len(testable)} моделей — полностью рабочих: {ok_count}")
-            # --- КОНЕЦ БЛОКА ТЕСТИРОВАНИЯ ИИ ---
 
             hide_broken = st.sidebar.checkbox(
-                "Показывать в списке только проверенные рабочие (100%)", value=False,
+                "Показывать только проверенные рабочие (100%)", value=False,
+                help="Непроверенные и нерабочие модели будут скрыты из списка.",
             )
 
             def _model_score(model_id):
@@ -1021,23 +1148,29 @@ else:
             display_catalog = sorted(model_catalog, key=lambda m: (-_model_score(m["id"]), m["is_free"] is not True, m["id"]))
             if hide_broken:
                 display_catalog = [m for m in display_catalog if _model_score(m["id"]) == 100]
+                if not display_catalog:
+                    st.sidebar.warning("Рабочих моделей по результатам проверки пока нет — снимите фильтр или запустите проверку.")
+            # ---------- КОНЕЦ БЛОКА ТЕСТИРОВАНИЯ ----------
 
             model_choices = [MANUAL_MODEL_OPTION] + display_catalog
             current_ids = [m["id"] for m in model_choices]
             default_index = current_ids.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in current_ids else 0
 
             def _format_model_option(m):
-                if m["id"] == "__manual__": return m["name"]
+                if m["id"] == "__manual__":
+                    return m["name"]
                 free_icon = '🆓' if m['is_free'] is True else ('💰' if m['is_free'] is False else '•')
-                test_result = st.session_state.model_test_results.get(m["id"])
-                if test_result:
-                    score = test_result["score"]
-                    test_icon = f"✅{score}%" if score == 100 else (f"⚠️{score}%" if score == 50 else f"❌{score}%")
+                tr = st.session_state.model_test_results.get(m["id"])
+                if tr:
+                    s = tr["score"]
+                    test_icon = f"✅{s}%" if s == 100 else (f"⚠️{s}%" if s == 50 else f"❌{s}%")
                 else:
                     test_icon = "…"
                 return f"{free_icon} {test_icon} {m['id']}"
 
             selected_model_entry = st.sidebar.selectbox("Модель", model_choices, index=default_index, format_func=_format_model_option)
+            if selected_model_entry.get("id") in st.session_state.model_test_results:
+                st.sidebar.caption(f"ℹ️ {st.session_state.model_test_results[selected_model_entry['id']]['detail']}")
             if selected_model_entry["id"] == "__manual__":
                 ai_model_input = st.sidebar.text_input("Свой слаг модели", value=st.session_state.cfg_ai_model)
             else:
@@ -1048,8 +1181,12 @@ else:
 
         st.sidebar.markdown("### <i class='fa-solid fa-video'></i> Сбор роликов", unsafe_allow_html=True)
         data_source_labels = {"apify": "🤖 Автоматически через Apify", "manual": "✍️ Вручную (таблица)"}
-        data_source_input = st.sidebar.selectbox("Источник данных", list(data_source_labels.keys()), index=list(data_source_labels.keys()).index(st.session_state.cfg_data_source_mode), format_func=lambda k: data_source_labels[k])
-        
+        data_source_input = st.sidebar.selectbox(
+            "Источник данных", list(data_source_labels.keys()),
+            index=list(data_source_labels.keys()).index(st.session_state.cfg_data_source_mode),
+            format_func=lambda k: data_source_labels[k],
+        )
+
         if data_source_input == "apify":
             apify_token_input = st.sidebar.text_input("Apify API-токен", value=st.session_state.cfg_apify_token, type="password")
             apify_actor_input = st.sidebar.text_input("Актор Apify", value=st.session_state.cfg_apify_actor)
@@ -1073,7 +1210,6 @@ else:
         st.sidebar.markdown("---")
         system_prompt_input = st.sidebar.text_area("Системный промпт для ИИ", value=st.session_state.system_prompt_cfg, height=220)
 
-        # СОХРАНЕНИЕ В БАЗУ ДАННЫХ ДЛЯ ВСЕХ МЕНЕДЖЕРОВ
         if st.sidebar.button("💾 Сохранить глобально", use_container_width=True, type="primary"):
             st.session_state.cfg_ai_provider_mode = provider_mode_input
             st.session_state.cfg_ai_base_url = ai_base_url_input
@@ -1093,24 +1229,19 @@ else:
             st.session_state.product_brief_default = product_brief_input
             st.session_state.system_prompt_cfg = system_prompt_input
 
-            set_setting("cfg_ai_provider_mode", provider_mode_input)
-            set_setting("cfg_ai_base_url", ai_base_url_input)
-            set_setting("cfg_ai_key", ai_key_input)
-            set_setting("cfg_ai_model", ai_model_input)
-            set_setting("cfg_max_tokens", str(max_tokens_input))
-            set_setting("cfg_data_source_mode", data_source_input)
-            set_setting("cfg_apify_token", apify_token_input)
-            set_setting("cfg_apify_actor", apify_actor_input)
-            set_setting("cfg_results_limit", str(results_limit_input))
-            set_setting("cfg_lookback_days", str(lookback_days_input))
-            set_setting("cfg_include_transcript", str(include_transcript_input))
-            set_setting("cfg_viral_threshold", str(viral_threshold_input))
-            set_setting("cfg_top_n_viral", str(top_n_viral_input))
-            set_setting("min_reels_required", str(min_reels_input))
-            set_setting("scenarios_count", str(scenarios_count_input))
-            set_setting("product_brief_default", product_brief_input)
-            set_setting("system_prompt_cfg", system_prompt_input)
-            
+            for k, v in [
+                ("cfg_ai_provider_mode", provider_mode_input), ("cfg_ai_base_url", ai_base_url_input),
+                ("cfg_ai_key", ai_key_input), ("cfg_ai_model", ai_model_input),
+                ("cfg_max_tokens", max_tokens_input), ("cfg_data_source_mode", data_source_input),
+                ("cfg_apify_token", apify_token_input), ("cfg_apify_actor", apify_actor_input),
+                ("cfg_results_limit", results_limit_input), ("cfg_lookback_days", lookback_days_input),
+                ("cfg_include_transcript", include_transcript_input), ("cfg_viral_threshold", viral_threshold_input),
+                ("cfg_top_n_viral", top_n_viral_input), ("min_reels_required", min_reels_input),
+                ("scenarios_count", scenarios_count_input), ("product_brief_default", product_brief_input),
+                ("system_prompt_cfg", system_prompt_input),
+            ]:
+                set_setting(k, v)
+
             st.sidebar.success("✅ Сохранено глобально! Доступно всем менеджерам.")
     else:
         st.sidebar.info("🔒 Настройки может менять только Администратор.")
@@ -1132,8 +1263,10 @@ else:
 
     def extract_instagram_username(url_or_username: str) -> str:
         text = (url_or_username or "").strip()
-        if not text: return text
-        if "instagram.com" not in text: return text.lstrip("@")
+        if not text:
+            return text
+        if "instagram.com" not in text:
+            return text.lstrip("@")
         tail = text.split("instagram.com/")[-1].split("?")[0]
         return tail.strip("/").split("/")[0]
 
@@ -1186,7 +1319,7 @@ else:
                 st.info(result["verdict_note"])
             if record.get("product_brief"):
                 st.caption(f"Бриф товара на момент анализа: {record['product_brief'][:300]}")
-            st.caption(f"Ссылка: {html.escape(record.get('blogger_url',''))}")
+            st.caption(f"Ссылка: {record.get('blogger_url','')}")
 
             if allow_delete:
                 if st.button("🗑 Удалить эту запись", key=f"del_{record['id']}"):
@@ -1206,7 +1339,7 @@ else:
         with tab_editor:
             st.markdown("#### 👑 PIN администратора")
             if admin_pin_is_default():
-                st.warning("Сейчас действует начальный PIN из кода. Смените его — иначе доступ к настройкам и данным всех менеджеров открыт любому.")
+                st.warning("Сейчас действует начальный PIN из кода. Смените его — сайт доступен из интернета, и доступ к настройкам и данным открыт любому, кто знает значение по умолчанию.")
             else:
                 st.caption("PIN администратора задан и хранится в базе в виде хеша.")
 
@@ -1217,17 +1350,22 @@ else:
                     new_admin_pin = st.text_input("Новый PIN", type="password", max_chars=PIN_LENGTH, placeholder="••••")
                     new_admin_pin2 = st.text_input("Повторите новый PIN", type="password", max_chars=PIN_LENGTH, placeholder="••••")
                     if st.form_submit_button("💾 Сохранить новый PIN", use_container_width=True, type="primary"):
-                        if not verify_admin_pin(cur_pin): st.error("Текущий PIN введён неверно.")
-                        elif len(new_admin_pin) != PIN_LENGTH or not new_admin_pin.isdigit(): st.error(f"Новый PIN должен состоять ровно из {PIN_LENGTH} цифр.")
-                        elif new_admin_pin != new_admin_pin2: st.error("Новый PIN и повтор не совпадают.")
+                        if not verify_admin_pin(cur_pin):
+                            st.error("Текущий PIN введён неверно.")
+                        elif len(new_admin_pin) != PIN_LENGTH or not new_admin_pin.isdigit():
+                            st.error(f"Новый PIN должен состоять ровно из {PIN_LENGTH} цифр.")
+                        elif new_admin_pin != new_admin_pin2:
+                            st.error("Новый PIN и повтор не совпадают.")
                         else:
                             ok, msg = set_admin_pin(new_admin_pin)
-                            if ok: st.success(msg + " При следующем входе используйте новый PIN.")
-                            else: st.error(msg)
+                            if ok:
+                                st.success(msg + " При следующем входе используйте новый PIN.")
+                            else:
+                                st.error(msg)
 
             st.markdown("---")
             st.markdown("#### Управление пользователями")
-            st.caption("PIN необязателен: если он не задан, вход под этим именем свободный.")
+            st.caption("PIN необязателен: если он не задан, вход под этим именем свободный. Для публичного сайта задайте PIN каждому.")
             all_managers = get_managers(active_only=False)
 
             with st.expander("➕ Добавить нового менеджера", expanded=False):
@@ -1280,7 +1418,8 @@ else:
                                 else:
                                     ok, msg = set_manager_password(mgr_name, new_pw or None)
                                     if ok:
-                                        if st.session_state.get("manager_logged_in") == mgr_name: st.session_state.manager_logged_in = None
+                                        if st.session_state.get("manager_logged_in") == mgr_name:
+                                            st.session_state.manager_logged_in = None
                                         st.success(msg)
                                         st.rerun()
                                     else:
@@ -1289,26 +1428,30 @@ else:
                         with st.form(f"rename_form_{mgr['id']}"):
                             new_name = st.text_input("Новое имя", value=mgr_name, key=f"rn_{mgr['id']}")
                             if st.form_submit_button("💾 Сохранить имя", use_container_width=True):
-                                if new_name.strip() == mgr_name: st.info("Имя не изменилось.")
+                                if new_name.strip() == mgr_name:
+                                    st.info("Имя не изменилось.")
                                 else:
                                     ok, msg = rename_manager(mgr_name, new_name)
                                     if ok:
                                         st.success(msg)
                                         st.rerun()
-                                    else: st.error(msg)
+                                    else:
+                                        st.error(msg)
                     with ec2:
                         st.markdown("**Удаление**")
                         st.caption(f"У этого менеджера {analyses_cnt} сохранённых анализов.")
                         also_delete_history = st.checkbox("Удалить вместе с историей анализов", key=f"delhist_{mgr['id']}")
                         confirm_delete = st.checkbox(f"Подтверждаю удаление «{mgr_name}»", key=f"confirm_{mgr['id']}")
                         if st.button("🗑 Удалить менеджера", key=f"delmgr_{mgr['id']}", use_container_width=True):
-                            if not confirm_delete: st.warning("Отметьте галочку подтверждения — удаление необратимо.")
+                            if not confirm_delete:
+                                st.warning("Отметьте галочку подтверждения — удаление необратимо.")
                             else:
                                 ok, msg = delete_manager(mgr_name, delete_history=also_delete_history)
                                 if ok:
                                     st.success(msg)
                                     st.rerun()
-                                else: st.error(msg)
+                                else:
+                                    st.error(msg)
 
     with tab_history:
         if is_admin:
@@ -1336,7 +1479,8 @@ else:
                 counts_map = {s["manager"]: s["total_analyses"] for s in stats}
                 all_mgr_names = [m["name"] for m in get_managers(active_only=False)]
                 for s in stats:
-                    if s["manager"] not in all_mgr_names: all_mgr_names.append(s["manager"])
+                    if s["manager"] not in all_mgr_names:
+                        all_mgr_names.append(s["manager"])
                 all_mgr_names.sort()
 
                 filter_options = ["Все менеджеры"] + all_mgr_names
@@ -1349,7 +1493,10 @@ else:
                 if search_q.strip():
                     q = search_q.strip().lower()
                     records = [r for r in records if q in (r.get("blogger_handle") or "").lower() or q in (r.get("blogger_url") or "").lower()]
-                st.caption(f"Найдено записей: {len(records)}")
+                if not records:
+                    st.info(f"У «{chosen_manager}» пока нет сохранённых анализов." if chosen_manager != "Все менеджеры" else "Ничего не найдено.")
+                else:
+                    st.caption(f"Найдено записей: {len(records)}")
                 for rec in records:
                     render_saved_analysis(rec, show_manager=True, allow_delete=True)
         else:
@@ -1359,8 +1506,10 @@ else:
             else:
                 total_scen = 0
                 for r in records:
-                    try: total_scen += len(json.loads(r.get("result_json") or "{}").get("scenarios", []))
-                    except json.JSONDecodeError: pass
+                    try:
+                        total_scen += len(json.loads(r.get("result_json") or "{}").get("scenarios", []))
+                    except json.JSONDecodeError:
+                        pass
                 unique_bloggers = len({r.get("blogger_handle") for r in records if r.get("blogger_handle")})
                 m1, m2, m3 = st.columns(3)
                 for col, val, label in ((m1, len(records), "анализов"), (m2, unique_bloggers, "блогеров"), (m3, total_scen, "сценариев")):
@@ -1405,13 +1554,16 @@ else:
             )
 
         btn_col1, btn_col2 = st.columns(2)
-        with btn_col1: submit_btn = st.button("🚀 Проанализировать ролики", use_container_width=True)
-        with btn_col2: test_btn = st.button("🧪 Заполнить тестовыми роликами", use_container_width=True) if active_data_source_mode == "manual" else False
+        with btn_col1:
+            submit_btn = st.button("🚀 Проанализировать ролики", use_container_width=True)
+        with btn_col2:
+            test_btn = st.button("🧪 Заполнить тестовыми роликами", use_container_width=True) if active_data_source_mode == "manual" else False
         st.markdown('</div>', unsafe_allow_html=True)
 
         if test_btn:
             st.session_state.reels_data = build_test_dataframe()
-            if "reels_editor_widget" in st.session_state: del st.session_state["reels_editor_widget"]
+            if "reels_editor_widget" in st.session_state:
+                del st.session_state["reels_editor_widget"]
             st.rerun()
 
         if submit_btn:
@@ -1444,8 +1596,10 @@ else:
 
                 if apify_debug_raw is not None or apify_debug_error is not None:
                     with st.expander("🔍 Сырой ответ Apify (для отладки)"):
-                        if apify_debug_error: st.code(apify_debug_error, language="text")
-                        if apify_debug_raw is not None: st.code(json.dumps(apify_debug_raw, ensure_ascii=False, indent=2) if not isinstance(apify_debug_raw, str) else apify_debug_raw, language="json")
+                        if apify_debug_error:
+                            st.code(apify_debug_error, language="text")
+                        if apify_debug_raw is not None:
+                            st.code(json.dumps(apify_debug_raw, ensure_ascii=False, indent=2) if not isinstance(apify_debug_raw, str) else apify_debug_raw, language="json")
 
                 if raw_df is not None and not apify_debug_error:
                     metrics_df, median_views = compute_reels_metrics(raw_df, active_viral_threshold)
@@ -1459,7 +1613,7 @@ else:
 
                         top_viral_df, threshold_met = select_top_viral(metrics_df, active_viral_threshold, active_top_n_viral)
                         if not threshold_met:
-                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Ни один ролик не превысил порог {active_viral_threshold}x медианы.</div>""", unsafe_allow_html=True)
+                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Ни один ролик не превысил порог {active_viral_threshold}x медианы — показываю топ по просмотрам.</div>""", unsafe_allow_html=True)
 
                         if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript and st.session_state.cfg_apify_token and not top_viral_df.empty):
                             top_links = [l for l in top_viral_df["Ссылка на ролик"].tolist() if l]
@@ -1495,7 +1649,7 @@ else:
                                 result = fallback_result("не задан API-ключ")
                             elif active_provider_mode == "anthropic_direct" and Anthropic is None:
                                 result = fallback_result("не установлена библиотека anthropic")
-                            elif active_provider_mode == "openrouter" and OpenAI is None:
+                            elif active_provider_mode != "anthropic_direct" and OpenAI is None:
                                 result = fallback_result("не установлена библиотека openai")
                             else:
                                 try:
@@ -1509,10 +1663,11 @@ else:
                                         response = call_chat_completion(client, active_model, messages=[{"role": "system", "content": active_system_prompt}, {"role": "user", "content": user_prompt}], max_tokens=active_max_tokens, provider_mode=active_provider_mode)
                                         raw_text = response.choices[0].message.content or ""
                                     debug_raw_text = raw_text
-                                    if not raw_text.strip(): raise ValueError("EMPTY_MODEL_RESPONSE")
+                                    if not raw_text.strip():
+                                        raise ValueError("EMPTY_MODEL_RESPONSE")
                                     result = json.loads(strip_json_fences(raw_text))
                                 except ValueError as exc:
-                                    result = fallback_result("лимит модели или пустой ответ") if str(exc) == "EMPTY_MODEL_RESPONSE" else fallback_result(f"ошибка: {exc}")
+                                    result = fallback_result("модель вернула пустой ответ — поднимите max_tokens или выберите другую модель") if str(exc) == "EMPTY_MODEL_RESPONSE" else fallback_result(f"ошибка: {exc}")
                                 except json.JSONDecodeError:
                                     result = fallback_result("не удалось разобрать ответ модели как JSON")
                                 except Exception as exc:
@@ -1521,8 +1676,10 @@ else:
 
                         if debug_raw_text is not None or debug_error_detail is not None:
                             with st.expander("🔍 Сырой ответ модели / детали ошибки (для отладки)"):
-                                if debug_error_detail: st.code(debug_error_detail, language="text")
-                                if debug_raw_text is not None: st.code(debug_raw_text if debug_raw_text else "(модель вернула пустую строку)", language="text")
+                                if debug_error_detail:
+                                    st.code(debug_error_detail, language="text")
+                                if debug_raw_text is not None:
+                                    st.code(debug_raw_text if debug_raw_text else "(модель вернула пустую строку)", language="text")
 
                         st.markdown(f"""<div class="ai-report-glass fade-in-container"><b>Общая картина по аудитории:</b><br>{html.escape(result.get("audience_summary", ""))}</div>""", unsafe_allow_html=True)
                         st.markdown("#### Найденные паттерны", unsafe_allow_html=True)
@@ -1550,7 +1707,7 @@ else:
                                     <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {html.escape(scenario.get("based_on_pattern", "—"))}</p>
                                     <hr style="border-color: rgba(255,255,255,0.1);">
                                     <p><b>Хук:</b> {html.escape(scenario.get("hook", ""))}</p>
-                                    <p><b>Сценарий:</b><br>{str(html.escape(scenario.get("script", ""))).replace(chr(10), "<br>")}</p>
+                                    <p><b>Сценарий:</b><br>{html.escape(scenario.get("script", "")).replace(chr(10), "<br>")}</p>
                                     <p><b>Подпись к посту:</b> {html.escape(scenario.get("caption", ""))}</p>
                                 </div>
                             """, unsafe_allow_html=True)
@@ -1565,7 +1722,9 @@ else:
                                 median_views=median_views, viral_count=len(top_viral_df) if threshold_met else 0,
                                 product_brief=product_brief, metrics_df=metrics_df, top_viral_df=top_viral_df, result=result,
                             )
-                            if saved_id: st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
-                            else: st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
+                            if saved_id:
+                                st.success(f"✅ Анализ сохранён (запись №{saved_id}) — смотрите на вкладке истории.")
+                            else:
+                                st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
                         else:
                             st.caption("Результат не сохранён в историю: ИИ не вернул готовых сценариев.")
