@@ -3,3 +3,4 @@ pandas
 openai
 anthropic
 httpx
+psycopg2-binary
