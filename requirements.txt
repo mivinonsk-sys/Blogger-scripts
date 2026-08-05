@@ -4,3 +4,4 @@ openai
 anthropic
 httpx
 psycopg2-binary
+starlette<0.41.0
