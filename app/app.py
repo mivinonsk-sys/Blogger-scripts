@@ -17,6 +17,7 @@ import sqlite3
 import hashlib
 import secrets
 import statistics
+import html
 from datetime import datetime
 from pathlib import Path
 
@@ -64,7 +65,7 @@ theme_class = "theme-night" if "Ночь" in st.session_state.theme_mode else "t
 is_night = "Ночь" in st.session_state.theme_mode
 is_night_js = "true" if is_night else "false"
 
-# === ПРЕМИУМ СТИЛИ И ГЛАССМОРФИЗМ (база оформления сохранена из исходного приложения) ===
+# === ПРЕМИУМ СТИЛИ И ГЛАССМОРФИЗМ ===
 st.markdown(f"""
     <head>
         <link href="https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
@@ -74,8 +75,6 @@ st.markdown(f"""
     <style>
     header[data-testid="stHeader"] {{ display: none !important; }}
 
-    /* Боковая панель зафиксирована открытой — кнопку сворачивания убираем,
-       чтобы панель нельзя было случайно свернуть и остаться без настроек */
     [data-testid="stSidebarCollapseButton"],
     [data-testid="stSidebarCollapsedControl"],
     [data-testid="collapsedControl"] {{
@@ -173,9 +172,8 @@ st.markdown(f"""
             radial-gradient(400px 200px at 85% 20%, rgba(255,255,255,0.4) 0%, rgba(255,255,255,0) 70%);
         pointer-events: none !important; z-index: 0 !important;
     }}
-    .stMainBlockContainer, [data-testid="stSidebar"], #intro-overlay, .global-theme-switcher {{ position: relative; z-index: 2 !important; }}
+    .stMainBlockContainer, [data-testid="stSidebar"], .global-theme-switcher {{ position: relative; z-index: 2 !important; }}
 
-    /* --- БОКОВАЯ ПАНЕЛЬ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day [data-testid="stSidebar"] {{
         background: rgba(255,255,255,0.72) !important;
         backdrop-filter: blur(20px) saturate(1.4); -webkit-backdrop-filter: blur(20px) saturate(1.4);
@@ -201,7 +199,6 @@ st.markdown(f"""
         color: #0a3a5c !important; font-size: 14px !important; font-weight: 700 !important;
     }}
 
-    /* --- КАРТОЧКИ МЕТРИК (ДНЕВНАЯ ТЕМА) --- */
     .theme-day .glass-metric {{
         background: rgba(255,255,255,0.65) !important;
         backdrop-filter: blur(16px); -webkit-backdrop-filter: blur(16px);
@@ -216,7 +213,6 @@ st.markdown(f"""
     .theme-day .metric-title {{ color: #5a8aa8 !important; }}
     .theme-day .metric-value {{ color: #0a3a5c !important; }}
 
-    /* --- ОТЧЁТ ИИ И СЦЕНАРИИ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day .ai-report-glass {{
         background: rgba(255,255,255,0.7) !important;
         backdrop-filter: blur(18px); -webkit-backdrop-filter: blur(18px);
@@ -224,7 +220,6 @@ st.markdown(f"""
         box-shadow: none !important; color: #0a3a5c !important;
     }}
 
-    /* --- ИНПУТЫ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day input, .theme-day select, .theme-day textarea {{
         background: rgba(255,255,255,0.8) !important; color: #0a3a5c !important;
         border: 0.5px solid rgba(10,142,217,0.25) !important; border-radius: 8px !important;
@@ -234,11 +229,9 @@ st.markdown(f"""
         box-shadow: 0 0 0 2px rgba(10,142,217,0.1) !important;
     }}
 
-    /* --- ТЕКСТ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day h1, .theme-day h2, .theme-day h3, .theme-day h4 {{ color: #0a3a5c !important; }}
     .theme-day span, .theme-day p {{ color: #1a5a7a !important; }}
 
-    /* --- КНОПКИ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day div.stButton > button,
     .theme-day div.stFormSubmitButton > button {{
         background: rgba(255,255,255,0.6) !important;
@@ -261,7 +254,6 @@ st.markdown(f"""
         box-shadow: 0 8px 24px rgba(10,142,217,0.35) !important; transform: translateY(-2px);
     }}
 
-    /* --- БЕЙДЖИ ПАТТЕРНОВ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day .badge-high {{ background: rgba(16,185,129,0.1) !important; color: #0d9668 !important; border-color: rgba(16,185,129,0.3) !important; }}
     .theme-day .badge-medium {{ background: rgba(245,158,11,0.1) !important; color: #b45309 !important; border-color: rgba(245,158,11,0.3) !important; }}
     .theme-day .badge-low {{ background: rgba(99,102,241,0.1) !important; color: #5346b5 !important; border-color: rgba(99,102,241,0.3) !important; }}
@@ -269,7 +261,6 @@ st.markdown(f"""
     .theme-day .fit-medium {{ color: #b45309 !important; }}
     .theme-day .fit-low {{ color: #dc2626 !important; }}
 
-    /* --- ПРЕДУПРЕЖДЕНИЯ / ОШИБКИ (ДНЕВНАЯ ТЕМА) --- */
     .theme-day .custom-warning {{
         background: rgba(10,142,217,0.06) !important; border-color: rgba(10,142,217,0.2) !important;
         color: #1a5a8a !important;
@@ -279,11 +270,8 @@ st.markdown(f"""
         color: #dc2626 !important;
     }}
 
-
-
     .fade-in-container {{ animation: smoothAppearScale 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards; }}
 
-    /* --- ПОЛЕ ВВОДА PIN (одной строкой) --- */
     .pin-wrap {{ max-width: 460px; margin: 40px auto 4px; text-align: center; }}
     .pin-title {{ font-size: 24px; font-weight: 800; margin-bottom: 8px; letter-spacing: -0.4px; }}
     .pin-subtitle {{ font-size: 14px; margin-bottom: 22px; line-height: 1.5; }}
@@ -320,11 +308,9 @@ st.markdown(f"""
         border-color: #ffffff !important;
         box-shadow: 0 0 0 3px rgba(255,255,255,0.08) !important;
     }}
-    /* убираем кнопку "показать пароль" — она ломает центровку PIN */
     .pin-single div[data-testid="stTextInput"] button {{ display: none !important; }}
     .pin-single div[data-testid="stTextInput"] label {{ display: none !important; }}
 
-    /* --- КАРТОЧКИ ИСТОРИИ АНАЛИЗОВ --- */
     .history-card {{
         border-radius: 14px; padding: 16px 18px; margin-bottom: 10px;
         transition: all 0.25s ease; position: relative;
@@ -376,61 +362,6 @@ st.markdown(f"""
     .theme-night .empty-state {{ background: rgba(15,23,42,0.4); color: #94a3b8; }}
     @keyframes smoothAppearScale {{ from {{opacity:0; transform: translateY(15px) scale(0.92);}} to {{opacity:1; transform: translateY(0) scale(1);}} }}
 
-    @keyframes titleZoomIn {{ 0% {{transform: scale(0.4); opacity:0;}} 100% {{transform: scale(1); opacity:1;}} }}
-    @keyframes neonPulseNight {{
-        0% {{ text-shadow: 0 0 10px rgba(56,189,248,0.4), 0 0 20px rgba(56,189,248,0.3), 0 0 40px rgba(129,140,248,0.4); filter: drop-shadow(0 0 10px rgba(56,189,248,0.5)); }}
-        50% {{ text-shadow: 0 0 20px rgba(56,189,248,0.8), 0 0 35px rgba(129,140,248,0.8), 0 0 60px rgba(56,189,248,0.9); filter: drop-shadow(0 0 20px rgba(129,140,248,0.8)); }}
-        100% {{ text-shadow: 0 0 10px rgba(56,189,248,0.4), 0 0 20px rgba(56,189,248,0.3), 0 0 40px rgba(129,140,248,0.4); filter: drop-shadow(0 0 10px rgba(56,189,248,0.5)); }}
-    }}
-    @keyframes neonPulseDay {{
-        0% {{ text-shadow: 0 0 10px rgba(2,132,199,0.3), 0 0 20px rgba(15,23,42,0.2); filter: drop-shadow(0 0 8px rgba(2,132,199,0.5)); }}
-        50% {{ text-shadow: 0 0 20px rgba(2,132,199,0.7), 0 0 35px rgba(3,105,161,0.6); filter: drop-shadow(0 0 15px rgba(2,132,199,0.8)); }}
-        100% {{ text-shadow: 0 0 10px rgba(2,132,199,0.3), 0 0 20px rgba(15,23,42,0.2); filter: drop-shadow(0 0 8px rgba(2,132,199,0.5)); }}
-    }}
-
-    #intro-overlay {{
-        position: fixed; top: 0; left: 0; width: 100vw; height: 100vh; z-index: 999998;
-        display: flex; flex-direction: column; align-items: center; justify-content: center;
-        transition: opacity 1.2s cubic-bezier(0.4,0,0.2,1), transform 1.2s cubic-bezier(0.4,0,0.2,1);
-    }}
-    .theme-night #intro-overlay {{ background: radial-gradient(circle at center, #0f172a 0%, #030712 100%); }}
-    .theme-day #intro-overlay {{ background: radial-gradient(circle at center, #e8f4fd 0%, #a0d8f4 100%); }}
-    .intro-content {{ text-align: center; padding: 40px; width: 90vw; max-width: 1500px; position: relative; }}
-    .intro-badge {{
-        display: inline-flex; align-items: center; gap: 12px; padding: 10px 24px; border-radius: 50px;
-        font-size: 14px; font-weight: 600; letter-spacing: 2px; text-transform: uppercase; margin-bottom: 20px;
-        opacity: 0; animation: fadeInBadge 0.8s ease 0.3s forwards;
-    }}
-    .intro-badge-row {{ display: block; width: 100%; text-align: center; }}
-    @keyframes fadeInBadge {{ to {{opacity:1;}} }}
-    .theme-night .intro-badge {{ background: rgba(56,189,248,0.1); border: 1px solid rgba(56,189,248,0.3); color: #38bdf8; }}
-    .theme-day .intro-badge {{ background: rgba(10,142,217,0.08); border: 0.5px solid rgba(10,142,217,0.25); color: #0a8ed9; }}
-    .intro-title {{
-        display: block; width: 100%; text-align: center;
-        font-size: clamp(38px, 5.5vw, 84px); font-weight: 800; margin: 0 auto 22px !important;
-        padding-bottom: 0.12em !important; letter-spacing: -1.5px; line-height: 1.15;
-        -webkit-background-clip: text; -webkit-text-fill-color: transparent;
-        white-space: nowrap; max-width: 100%;
-    }}
-    .theme-night .intro-title.neon-active {{ background-image: linear-gradient(135deg, #ffffff 0%, #38bdf8 50%, #818cf8 100%); animation: titleZoomIn 2.5s cubic-bezier(0.15,0.85,0.35,1.2) forwards, neonPulseNight 3s ease-in-out infinite; }}
-    .theme-day .intro-title.neon-active {{ background-image: linear-gradient(135deg, #0a3a5c 0%, #0a8ed9 50%, #3bb8f0 100%); animation: titleZoomIn 2.5s cubic-bezier(0.15,0.85,0.35,1.2) forwards, neonPulseDay 3s ease-in-out infinite; }}
-    .intro-subtitle {{
-        font-size: clamp(18px, 1.8vw, 26px); margin-bottom: 40px; font-weight: 400; line-height: 1.5;
-        max-width: 1100px; margin-left: auto; margin-right: auto; opacity: 0; animation: fadeInSub 1s ease 1.8s forwards;
-    }}
-    @keyframes fadeInSub {{ to {{opacity:1;}} }}
-    .theme-night .intro-subtitle {{ color: #94a3b8; }}
-    .theme-day .intro-subtitle {{ color: #2a6a8a; }}
-    .intro-btn {{
-        color: white; border: none; padding: 22px 60px; font-size: 20px; font-weight: 700; border-radius: 16px;
-        cursor: pointer; transition: all 0.3s ease; opacity: 0; animation: fadeInBtn 1s ease 2.2s forwards;
-    }}
-    @keyframes fadeInBtn {{ to {{opacity:1;}} }}
-    .theme-night .intro-btn {{ background: linear-gradient(135deg, #38bdf8 0%, #818cf8 100%); box-shadow: 0 12px 40px rgba(56,189,248,0.5); }}
-    .theme-night .intro-btn:hover {{ transform: translateY(-3px); box-shadow: 0 15px 50px rgba(56,189,248,0.8); }}
-    .theme-day .intro-btn {{ background: linear-gradient(135deg, #0a8ed9 0%, #0670b0 100%); box-shadow: 0 8px 28px rgba(10,142,217,0.3); border-radius: 12px; }}
-    .theme-day .intro-btn:hover {{ transform: translateY(-3px); box-shadow: 0 12px 36px rgba(10,142,217,0.45); }}
-
     .custom-warning {{
         padding: 18px 24px; border-radius: 14px; background: rgba(14,165,233,0.12); backdrop-filter: blur(14px);
         -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(14,165,233,0.4); display: flex;
@@ -456,62 +387,42 @@ st.markdown(f"""
     </style>
 """, unsafe_allow_html=True)
 
-# --- ГЛОБАЛЬНЫЙ СКРИПТ ПЕРЕКЛЮЧАТЕЛЯ ТЕМЫ И ОВЕРЛЕЯ (без изменений по логике) ---
+# --- ГЛОБАЛЬНЫЙ СКРИПТ ПЕРЕКЛЮЧАТЕЛЯ ТЕМЫ ---
 components.html(f"""
 <script>
-const parentDoc = window.parent.document;
-const body = parentDoc.body;
-const themeClass = "{theme_class}";
-body.classList.remove('theme-night', 'theme-day');
-body.classList.add(themeClass);
+try {{
+    const parentDoc = window.parent.document;
+    const body = parentDoc.body;
+    const themeClass = "{theme_class}";
+    body.classList.remove('theme-night', 'theme-day');
+    body.classList.add(themeClass);
 
-const isNight = {is_night_js};
-const nightUrl = new URL(parentDoc.location.href); nightUrl.searchParams.set('theme', '🌙 Ночь');
-const dayUrl = new URL(parentDoc.location.href); dayUrl.searchParams.set('theme', '☀️ День');
+    const isNight = {is_night_js};
+    const nightUrl = new URL(parentDoc.location.href); nightUrl.searchParams.set('theme', '🌙 Ночь');
+    const dayUrl = new URL(parentDoc.location.href); dayUrl.searchParams.set('theme', '☀️ День');
 
-window.parent.enterSystem = function() {{
-    const overlay = parentDoc.getElementById('intro-overlay');
-    if (overlay) {{
-        overlay.style.opacity = '0'; overlay.style.transform = 'scale(1.08)';
-        setTimeout(() => {{ overlay.remove(); }}, 1200);
+    let globalSwitcher = parentDoc.getElementById('global-theme-switcher-unique');
+    if (!globalSwitcher) {{
+        globalSwitcher = parentDoc.createElement('div');
+        globalSwitcher.id = 'global-theme-switcher-unique';
+        globalSwitcher.className = 'global-theme-switcher';
+        parentDoc.body.appendChild(globalSwitcher);
     }}
-}};
-
-let globalSwitcher = parentDoc.getElementById('global-theme-switcher-unique');
-if (!globalSwitcher) {{
-    globalSwitcher = parentDoc.createElement('div');
-    globalSwitcher.id = 'global-theme-switcher-unique';
-    globalSwitcher.className = 'global-theme-switcher';
-    parentDoc.body.appendChild(globalSwitcher);
-}}
-globalSwitcher.innerHTML = `
-    <a href="${{nightUrl.toString()}}" class="theme-opt-btn ${{isNight ? 'active' : 'inactive'}}">🌙 Ночь</a>
-    <a href="${{dayUrl.toString()}}" class="theme-opt-btn ${{!isNight ? 'active' : 'inactive'}}">☀️ День</a>
-`;
-
-let overlay = parentDoc.getElementById('intro-overlay');
-if (!overlay) {{
-    overlay = parentDoc.createElement('div');
-    overlay.id = 'intro-overlay';
-    parentDoc.body.appendChild(overlay);
-    overlay.innerHTML = `
-        <div class="intro-content">
-            <div class="intro-badge-row"><div class="intro-badge"><i class="fa-solid fa-clapperboard"></i> Корпоративный портал</div></div>
-            <div class="intro-title neon-active" id="animated-intro-title">ТрейдИндустрия</div>
-            <div class="intro-subtitle">
-                Разбираем, какие ролики заходят аудитории блогера, и пишем сценарии с нашим товаром под её формат.
-            </div>
-            <button class="intro-btn" onclick="window.parent.enterSystem()">
-                Инициализировать систему <i class="fa-solid fa-arrow-right" style="margin-left: 10px;"></i>
-            </button>
-        </div>
+    globalSwitcher.innerHTML = `
+        <a href="${{nightUrl.toString()}}" class="theme-opt-btn ${{isNight ? 'active' : 'inactive'}}">🌙 Ночь</a>
+        <a href="${{dayUrl.toString()}}" class="theme-opt-btn ${{!isNight ? 'active' : 'inactive'}}">☀️ День</a>
     `;
+}} catch(e) {{
+    console.log("Ограничение iframe: переключатель тем скрыт.");
 }}
 </script>
 """, height=0, width=0)
 
 # ============================================================================
-# ХРАНИЛИЩЕ ДАННЫХ (SQLite — файл рядом со скриптом, переживает перезапуски)
+# ХРАНИЛИЩЕ ДАННЫХ (SQLite)
+# ВНИМАНИЕ: На бесплатных серверах вроде Streamlit Community Cloud эта БД 
+# обнуляется при перезапуске (засыпании) сервера. Для продакшена используйте 
+# внешнее облачное хранилище.
 # ============================================================================
 DB_PATH = Path(__file__).parent / "blogger_analyses.db"
 
@@ -561,7 +472,6 @@ def init_db():
                 value TEXT
             )
         """)
-        # первичное заполнение списком менеджеров из исходной версии
         existing = conn.execute("SELECT COUNT(*) AS c FROM managers").fetchone()["c"]
         if existing == 0:
             seed = [
@@ -653,7 +563,6 @@ def rename_manager(old_name, new_name):
     try:
         with db_connect() as conn:
             conn.execute("UPDATE managers SET name = ? WHERE name = ?", (new_name, old_name))
-            # переносим историю анализов на новое имя, чтобы она не потерялась
             conn.execute("UPDATE analyses SET manager = ? WHERE manager = ?", (new_name, old_name))
         return True, f"Переименован: «{old_name}» → «{new_name}» (история перенесена)."
     except sqlite3.IntegrityError:
@@ -705,8 +614,6 @@ def set_setting(key, value):
 
 
 def verify_admin_pin(pin: str) -> bool:
-    """PIN админа хранится в базе хешем. Если он там ещё не задан — используется
-    начальный ADMIN_PIN_DEFAULT из кода (его следует сменить через интерфейс)."""
     stored_hash = get_setting("admin_pin_hash")
     stored_salt = get_setting("admin_pin_salt")
     if not stored_hash or not stored_salt:
@@ -722,7 +629,6 @@ def set_admin_pin(new_pin: str):
 
 
 def admin_pin_is_default() -> bool:
-    """True, если PIN админа ещё не менялся через интерфейс."""
     return not (get_setting("admin_pin_hash") and get_setting("admin_pin_salt"))
 
 
@@ -730,15 +636,15 @@ def admin_pin_is_default() -> bool:
 # PIN-ПАНЕЛЬ И АНИМАЦИЯ УСПЕШНОГО ВХОДА
 # ============================================================================
 PIN_LENGTH = 4
-ADMIN_PIN_DEFAULT = "0000"  # начальный PIN до первой смены через «Редактор менеджеров»
+ADMIN_PIN_DEFAULT = "0000"
 
 
 def render_pin_pad(form_key: str, title: str, subtitle: str):
     """Панель ввода PIN одной строкой. Возвращает (submitted, pin_string)."""
     st.markdown(f"""
         <div class="pin-wrap fade-in-container">
-            <div class="pin-title">{title}</div>
-            <div class="pin-subtitle">{subtitle}</div>
+            <div class="pin-title">{html.escape(title)}</div>
+            <div class="pin-subtitle">{html.escape(subtitle)}</div>
         </div>
     """, unsafe_allow_html=True)
 
@@ -774,51 +680,30 @@ def play_success_animation(message="Доступ разрешён"):
         <div style="position:relative;margin-bottom:18px;">
           <div class="ring"></div>
           <div class="check-circle"><svg width="34" height="34" viewBox="0 0 24 24" fill="none"
-               stroke="#052e16" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
-               <polyline points="20 6 9 17 4 12"></polyline></svg></div>
+                stroke="#052e16" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round">
+                <polyline points="20 6 9 17 4 12"></polyline></svg></div>
         </div>
-        <div style="font-size:20px;font-weight:800;color:#0a3a5c;margin-bottom:4px;">{message}</div>
+        <div style="font-size:20px;font-weight:800;color:#0a3a5c;margin-bottom:4px;">{html.escape(message)}</div>
         <div style="display:inline-flex;align-items:center;gap:7px;padding:7px 16px;background:rgba(16,185,129,0.12);
-             color:#0d9668;border-radius:20px;font-size:13px;font-weight:600;margin-top:8px;">
+              color:#0d9668;border-radius:20px;font-size:13px;font-weight:600;margin-top:8px;">
           <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4"
-               stroke-linecap="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect>
-               <path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
+                stroke-linecap="round"><rect x="3" y="11" width="18" height="11" rx="2"></rect>
+                <path d="M7 11V7a5 5 0 0 1 10 0v4"></path></svg>
           Вход выполнен
         </div>
       </div>
     </div>
 
     <style>
-      .dot {{
-        width:14px;height:14px;background:#0a8ed9;border-radius:50%;
-        animation: dotEaten 0.12s linear forwards;
-      }}
+      .dot {{ width:14px;height:14px;background:#0a8ed9;border-radius:50%; animation: dotEaten 0.12s linear forwards; }}
       @keyframes dotEaten {{ to {{ opacity:0; transform:scale(0.2); }} }}
-
       #pacman {{ position:absolute; animation: pacMove 2s linear forwards; }}
       @keyframes pacMove {{ from {{ transform: translateX(-135px); }} to {{ transform: translateX(135px); }} }}
-
-      .pac-body {{
-        width:0;height:0;border-radius:50%;
-        border:22px solid #facc15; border-right-color:transparent;
-        animation: chomp 0.32s infinite;
-      }}
-      @keyframes chomp {{
-        0%,100% {{ border-right-color: transparent; }}
-        50% {{ border-right-color: #facc15; }}
-      }}
-
-      .check-circle {{
-        width:76px;height:76px;background:#10b981;border-radius:50%;
-        display:flex;align-items:center;justify-content:center;position:relative;z-index:2;
-        animation: popIn 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards;
-      }}
+      .pac-body {{ width:0;height:0;border-radius:50%; border:22px solid #facc15; border-right-color:transparent; animation: chomp 0.32s infinite; }}
+      @keyframes chomp {{ 0%,100% {{ border-right-color: transparent; }} 50% {{ border-right-color: #facc15; }} }}
+      .check-circle {{ width:76px;height:76px;background:#10b981;border-radius:50%; display:flex;align-items:center;justify-content:center;position:relative;z-index:2; animation: popIn 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards; }}
       @keyframes popIn {{ from {{ transform:scale(0); }} 60% {{ transform:scale(1.15); }} to {{ transform:scale(1); }} }}
-
-      .ring {{
-        position:absolute;inset:0;background:#10b981;border-radius:50%;z-index:1;
-        animation: ringOut 0.85s ease-out forwards;
-      }}
+      .ring {{ position:absolute;inset:0;background:#10b981;border-radius:50%;z-index:1; animation: ringOut 0.85s ease-out forwards; }}
       @keyframes ringOut {{ from {{ transform:scale(0.6); opacity:0.85; }} to {{ transform:scale(2.2); opacity:0; }} }}
     </style>
 
@@ -910,55 +795,53 @@ if "admin_logged_in" not in st.session_state:
 if "manager_logged_in" not in st.session_state:
     st.session_state.manager_logged_in = None
 
-# --- Провайдер ИИ: OpenRouter (OpenAI-совместимый) или Anthropic напрямую (свой формат запроса) ---
 if "cfg_ai_provider_mode" not in st.session_state:
-    st.session_state.cfg_ai_provider_mode = "openrouter"  # "openrouter" | "anthropic_direct"
+    st.session_state.cfg_ai_provider_mode = "openrouter"
 
 if "cfg_ai_base_url" not in st.session_state:
     st.session_state.cfg_ai_base_url = "https://openrouter.ai/api/v1"
 
 if "cfg_ai_key" not in st.session_state:
-    st.session_state.cfg_ai_key = ""  # ключ OpenRouter (sk-or-...) или Anthropic (sk-ant-...)
+    st.session_state.cfg_ai_key = ""
 
 if "cfg_ai_model" not in st.session_state:
-    st.session_state.cfg_ai_model = "anthropic/claude-sonnet-5"  # слаг зависит от режима — см. ниже
+    st.session_state.cfg_ai_model = "anthropic/claude-sonnet-5"
 
 if "cfg_max_tokens" not in st.session_state:
-    st.session_state.cfg_max_tokens = 3000  # ниже, чтобы уложиться в небольшой баланс OpenRouter; поднимите после пополнения
+    st.session_state.cfg_max_tokens = 3000
 
 if "available_models" not in st.session_state:
-    st.session_state.available_models = []  # заполняется кнопкой "Обновить список моделей" (только для OpenRouter)
+    st.session_state.available_models = []
 
 if "model_test_results" not in st.session_state:
-    st.session_state.model_test_results = {}  # model_id -> {"score": 0|50|100, "detail": str}
+    st.session_state.model_test_results = {}
 
 if "cfg_max_models_to_test" not in st.session_state:
-    st.session_state.cfg_max_models_to_test = 40  # сколько моделей проверять за один клик "Проверить"
+    st.session_state.cfg_max_models_to_test = 40
 
-# --- Сбор роликов: автоматически через Apify или вручную ---
 if "cfg_data_source_mode" not in st.session_state:
-    st.session_state.cfg_data_source_mode = "apify"  # "apify" | "manual"
+    st.session_state.cfg_data_source_mode = "apify"
 
 if "cfg_apify_token" not in st.session_state:
-    st.session_state.cfg_apify_token = ""  # apify.com -> Settings -> Integrations -> API token
+    st.session_state.cfg_apify_token = ""
 
 if "cfg_apify_actor" not in st.session_state:
     st.session_state.cfg_apify_actor = "apify/instagram-reel-scraper"
 
 if "cfg_results_limit" not in st.session_state:
-    st.session_state.cfg_results_limit = 25  # сколько роликов тянуть с профиля перед отбором "залётных"
+    st.session_state.cfg_results_limit = 25
 
 if "cfg_lookback_days" not in st.session_state:
-    st.session_state.cfg_lookback_days = 30  # глубина по ТЗ — 30-45 дней
+    st.session_state.cfg_lookback_days = 30
 
 if "cfg_include_transcript" not in st.session_state:
-    st.session_state.cfg_include_transcript = True  # платный доп. модуль актора — реальная транскрипция речи
+    st.session_state.cfg_include_transcript = True
 
 if "cfg_viral_threshold" not in st.session_state:
-    st.session_state.cfg_viral_threshold = 2.5  # порог "залётности" к медиане, по ТЗ 2.5-3x
+    st.session_state.cfg_viral_threshold = 2.5
 
 if "cfg_top_n_viral" not in st.session_state:
-    st.session_state.cfg_top_n_viral = 3  # топ-N по ТЗ
+    st.session_state.cfg_top_n_viral = 3
 
 if "min_reels_required" not in st.session_state:
     st.session_state.min_reels_required = 8
@@ -1029,8 +912,6 @@ if "system_prompt_cfg" not in st.session_state:
 
 MANUAL_MODEL_OPTION = {"id": "__manual__", "name": "✍️ Ввести свой слаг вручную", "is_free": None, "context_length": None}
 
-# Небольшие стартовые наборы — только на случай, если ещё ни разу не нажали "Обновить".
-# Каталоги провайдеров меняются часто, поэтому это не авторитетный источник — только подстраховка.
 STARTER_MODEL_CATALOG = [
     {"id": "anthropic/claude-sonnet-5", "name": "Claude Sonnet 5", "is_free": False, "context_length": 1000000},
     {"id": "anthropic/claude-opus-4.8", "name": "Claude Opus 4.8", "is_free": False, "context_length": 1000000},
@@ -1045,7 +926,6 @@ GEMINI_STARTER_CATALOG = [
 
 
 def fetch_openai_compatible_models(base_url: str, api_key: str):
-    """Тянет актуальный список моделей с любого OpenAI-совместимого base_url (OpenRouter, Gemini и т.п.)."""
     if httpx is None:
         raise RuntimeError("Библиотека httpx не установлена (обычно ставится вместе с openai)")
     models_url = base_url.rstrip("/") + "/models"
@@ -1057,7 +937,7 @@ def fetch_openai_compatible_models(base_url: str, api_key: str):
     parsed = []
     for m in payload:
         pricing = m.get("pricing")
-        is_free = None  # неизвестно, если провайдер вообще не отдаёт информацию о цене (например, Gemini)
+        is_free = None
         if isinstance(pricing, dict):
             try:
                 prompt_price = float(pricing.get("prompt", "0") or "0")
@@ -1071,15 +951,11 @@ def fetch_openai_compatible_models(base_url: str, api_key: str):
             "context_length": m.get("context_length") or 0,
             "is_free": is_free,
         })
-    # бесплатные — в начале списка, дальше по алфавиту id (неизвестные — после платных, перед пустыми)
     parsed.sort(key=lambda x: (x["is_free"] is not True, x["id"]))
     return parsed
 
 
 def guess_gemini_free_tier(model_id: str):
-    """Google не отдаёт цену через /models — определяем по названию модели (эвристика, не факт).
-    На середину 2026: Pro-модели ушли только на платный тариф, Flash/Flash-Lite остаются бесплатными
-    в рамках дневных лимитов. Это может снова измениться — см. ai.google.dev/pricing."""
     text = model_id.lower()
     if "pro" in text:
         return False
@@ -1118,9 +994,6 @@ TEST_USER_PROMPT = (
 
 
 def call_chat_completion(client, model, messages, max_tokens, provider_mode):
-    """Обёртка над chat.completions.create — для Gemini явно отключает "мышление" (reasoning_effort),
-    иначе модель может потратить весь max_tokens на невидимые размышления и вернуть пустой content.
-    Если модель не поддерживает отключение (например, Pro-версии) — тихо повторяем без этого параметра."""
     if provider_mode == "gemini":
         try:
             return client.chat.completions.create(
@@ -1136,8 +1009,6 @@ def call_chat_completion(client, model, messages, max_tokens, provider_mode):
 
 
 def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
-    """Один лёгкий реальный вызов модели — проверяем, отвечает ли вообще и держит ли строгий JSON-формат,
-    то есть реально ли способна выполнить именно НАШУ задачу, а не просто числится доступной."""
     try:
         if provider_mode == "anthropic_direct":
             if Anthropic is None:
@@ -1164,7 +1035,7 @@ def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
     except Exception as exc:
         msg = str(exc)
         if "429" in msg or "RESOURCE_EXHAUSTED" in msg or "rate limit" in msg.lower():
-            return {"score": 0, "detail": "упёрлись в лимит запросов сейчас (429) — не факт, что модель нерабочая, попробуйте проверить её позже отдельно"}
+            return {"score": 0, "detail": "упёрлись в лимит запросов сейчас (429) — попробуйте проверить её позже отдельно"}
         return {"score": 0, "detail": f"{type(exc).__name__}: {msg[:180]}"}
 
     try:
@@ -1198,21 +1069,21 @@ if "reels_data" not in st.session_state:
 
 def build_test_dataframe():
     rows = [
-        ("instagram.com/reel/demo1", 210000, 15200, 810, 4100, "2026-05-02",
+        ("[instagram.com/reel/demo1](https://instagram.com/reel/demo1)", 210000, 15200, 810, 4100, "2026-05-02",
          "Примерка нескольких образов подряд под трендовый звук, хук — 'а что если без макияжа'", ""),
-        ("instagram.com/reel/demo2", 45000, 1800, 90, 320, "2026-05-06",
+        ("[instagram.com/reel/demo2](https://instagram.com/reel/demo2)", 45000, 1800, 90, 320, "2026-05-06",
          "Обзор ткани и посадки одного изделия, спокойный разговор на камеру", ""),
-        ("instagram.com/reel/demo3", 320000, 28000, 1450, 9200, "2026-05-10",
+        ("[instagram.com/reel/demo3](https://instagram.com/reel/demo3)", 320000, 28000, 1450, 9200, "2026-05-10",
          "Юмористический скетч в примерочной с подругой, неожиданный твист в конце", ""),
-        ("instagram.com/reel/demo4", 60000, 3100, 210, 540, "2026-05-14",
+        ("[instagram.com/reel/demo4](https://instagram.com/reel/demo4)", 60000, 3100, 210, 540, "2026-05-14",
          "Монолог на камеру про бодипозитив, без визуальных эффектов", ""),
-        ("instagram.com/reel/demo5", 38000, 1200, 60, 210, "2026-05-18",
+        ("[instagram.com/reel/demo5](https://instagram.com/reel/demo5)", 38000, 1200, 60, 210, "2026-05-18",
          "ASMR распаковка посылки с одеждой", ""),
-        ("instagram.com/reel/demo6", 150000, 11000, 640, 3900, "2026-05-22",
+        ("[instagram.com/reel/demo6](https://instagram.com/reel/demo6)", 150000, 11000, 640, 3900, "2026-05-22",
          "До/после в утягивающей одежде под платье, резкая смена кадра на бит", ""),
-        ("instagram.com/reel/demo7", 95000, 7200, 380, 1900, "2026-05-26",
+        ("[instagram.com/reel/demo7](https://instagram.com/reel/demo7)", 95000, 7200, 380, 1900, "2026-05-26",
          "Трендовый танцевальный челлендж в новой одежде", ""),
-        ("instagram.com/reel/demo8", 30000, 900, 40, 150, "2026-05-30",
+        ("[instagram.com/reel/demo8](https://instagram.com/reel/demo8)", 30000, 900, 40, 150, "2026-05-30",
          "Компиляция сторис без единого сюжета", ""),
     ]
     return pd.DataFrame(rows, columns=REELS_COLUMNS)
@@ -1228,12 +1099,10 @@ def apify_get_first(item: dict, keys, default=""):
 
 def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_days=None,
                            include_transcript=False, skip_pinned=True, skip_trial=True, timeout=300):
-    """Синхронно запускает Apify-актор и возвращает список сырых элементов датасета.
-    targets — список username/URL профилей ИЛИ прямых ссылок на конкретные ролики."""
     if httpx is None:
         raise RuntimeError("Библиотека httpx не установлена")
     actor_path = actor.strip("/").replace("/", "~")
-    url = f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items?token={token}"
+    url = f"[https://api.apify.com/v2/acts/](https://api.apify.com/v2/acts/){actor_path}/run-sync-get-dataset-items?token={token}"
     body = {
         "username": targets,
         "skipPinnedPosts": skip_pinned,
@@ -1251,8 +1120,6 @@ def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_da
 
 
 def apify_items_to_dataframe(items):
-    """Приводит сырые элементы датасета Apify к тому же табличному виду, что и ручной ввод,
-    чтобы дальше использовать один и тот же расчёт метрик (compute_reels_metrics)."""
     rows = []
     for item in items:
         views = apify_get_first(item, ["videoPlayCount", "videoViewCount", "playsCount", "viewsCount", "playCount", "viewCount"], 0)
@@ -1268,7 +1135,7 @@ def apify_items_to_dataframe(items):
             "Просмотры": views,
             "Лайки": likes,
             "Комментарии": comments,
-            "Сохранения": shares,  # у Reels нет отдельных "сохранений" в открытых данных — кладём shares как ближайший аналог
+            "Сохранения": shares,
             "Дата публикации": str(timestamp)[:10],
             "Что происходит в ролике (кратко)": str(caption)[:300],
             "Транскрипция (если есть)": transcript,
@@ -1286,7 +1153,6 @@ def strip_json_fences(text: str) -> str:
 
 
 def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
-    """Простая арифметика (не 'анализ'): ER% и индекс отклика к медиане просмотров блогера."""
     clean = df.copy()
     clean = clean[clean["Ссылка на ролик"].astype(str).str.strip() != ""]
     clean["Просмотры"] = pd.to_numeric(clean["Просмотры"], errors="coerce").fillna(0)
@@ -1314,11 +1180,9 @@ def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
 
 
 def select_top_viral(metrics_df: pd.DataFrame, threshold: float, top_n: int):
-    """Топ-N роликов с индексом выше порога, отсортированные по убыванию — по логике ТЗ."""
     qualifying = metrics_df[metrics_df["Индекс_к_медиане"].apply(lambda x: bool(x and x >= threshold))]
     qualifying = qualifying.sort_values("Индекс_к_медиане", ascending=False)
     if qualifying.empty:
-        # если под порог никто не попал — берём топ-N просто по просмотрам, чтобы не остаться без анализа
         fallback = metrics_df.sort_values("Просмотры", ascending=False).head(top_n)
         return fallback, False
     return qualifying.head(top_n), True
@@ -1328,7 +1192,7 @@ def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_sc
     table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
     viral_block = ""
     if top_viral_df is not None and not top_viral_df.empty:
-        viral_records = top_viral_df.to_dict(orient="records")  # включает транскрипцию, если есть
+        viral_records = top_viral_df.to_dict(orient="records")
         viral_block = (
             f"\n\nТоп-{len(viral_records)} самых залётных роликов ЭТОГО блогера "
             f"(здесь есть поле 'Транскрипция (если есть)' — используй именно его для разбора хука и структуры, "
@@ -1417,7 +1281,7 @@ elif (selected_manager != "👑 Администратор"
     st.session_state.admin_logged_in = False
     submitted, entered_pin = render_pin_pad(
         "manager_pin_form",
-        f"Вход: {selected_manager}",
+        f"Вход: {html.escape(selected_manager)}",
         f"Для этого пользователя администратор задал {PIN_LENGTH}-значный PIN.",
     )
     if submitted:
@@ -1442,7 +1306,7 @@ else:
     st.markdown(f"""
         <div class="fade-in-container">
             <p style='margin-top: -5px; margin-bottom: 20px; font-weight: 600;'>
-                <i class='fa-solid fa-user-shield'></i> Вы зашли как: <b style='color: {accent};'>{selected_manager}</b> | Режим: <b>{st.session_state.theme_mode}</b>
+                <i class='fa-solid fa-user-shield'></i> Вы зашли как: <b style='color: {accent};'>{html.escape(selected_manager)}</b> | Режим: <b>{st.session_state.theme_mode}</b>
             </p>
         </div>
     """, unsafe_allow_html=True)
@@ -1461,11 +1325,11 @@ else:
             "anthropic_direct": "Anthropic напрямую",
         }
         provider_presets = {
-            "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_label": "API-ключ (OpenRouter)",
+            "openrouter": {"base_url": "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)", "key_label": "API-ключ (OpenRouter)",
                            "key_help": "openrouter.ai/workspaces/default/keys (начинается с sk-or-...)."},
-            "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+            "gemini": {"base_url": "[https://generativelanguage.googleapis.com/v1beta/openai/](https://generativelanguage.googleapis.com/v1beta/openai/)",
                        "key_label": "API-ключ (Google AI Studio / Gemini)",
-                       "key_help": "aistudio.google.com/api-keys (начинается с AIza...)."},
+                       "key_help": "[aistudio.google.com/api-keys](https://aistudio.google.com/api-keys) (начинается с AIza...)."},
         }
         provider_mode_input = st.sidebar.selectbox(
             "Способ вызова ИИ", list(provider_mode_labels.keys()),
@@ -1485,10 +1349,9 @@ else:
                 "Модель", direct_model_options,
                 index=direct_model_options.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in direct_model_options else 0,
             )
-            ai_base_url_input = "https://api.anthropic.com"  # не используется для этого режима, но сохраняем для консистентности
+            ai_base_url_input = "[https://api.anthropic.com](https://api.anthropic.com)"
         else:
             preset = provider_presets[provider_mode_input]
-            # если режим только что переключили — подставляем URL пресета, иначе оставляем сохранённое значение
             default_base_url = st.session_state.cfg_ai_base_url if st.session_state.cfg_ai_provider_mode == provider_mode_input else preset["base_url"]
             ai_base_url_input = st.sidebar.text_input("Base URL API", value=default_base_url, help=f"По умолчанию: {preset['base_url']}")
             ai_key_input = st.sidebar.text_input(
@@ -1533,7 +1396,7 @@ else:
                 for i, m in enumerate(testable):
                     progress.progress(i / max(len(testable), 1), text=f"Проверяю {m['id']} ({i + 1}/{len(testable)})...")
                     results[m["id"]] = test_single_model(provider_mode_input, ai_base_url_input, ai_key_input, m["id"])
-                    time.sleep(2.5)  # бережём лимит запросов в минуту, особенно на бесплатных тарифах
+                    time.sleep(2.5)
                 progress.progress(1.0, text="Готово!")
                 st.session_state.model_test_results = results
                 st.session_state.cfg_max_models_to_test = max_models_to_test_input
@@ -1547,7 +1410,7 @@ else:
 
             def _model_score(model_id):
                 r = st.session_state.model_test_results.get(model_id)
-                return r["score"] if r else -1  # -1 = ещё не проверяли, идёт последними
+                return r["score"] if r else -1
 
             display_catalog = sorted(model_catalog, key=lambda m: (-_model_score(m["id"]), m["is_free"] is not True, m["id"]))
             if hide_broken:
@@ -1694,7 +1557,7 @@ else:
             return text
         if "instagram.com" not in text:
             return text.lstrip("@")
-        tail = text.split("instagram.com/")[-1].split("?")[0]
+        tail = text.split("[instagram.com/](https://instagram.com/)")[-1].split("?")[0]
         return tail.strip("/").split("/")[0]
 
     def render_saved_analysis(record, show_manager=False, allow_delete=False):
@@ -1704,11 +1567,11 @@ else:
         except json.JSONDecodeError:
             result = {}
         created = (record.get("created_at") or "").replace("T", " ")
-        handle = record.get("blogger_handle") or record.get("blogger_url", "")
+        handle = html.escape(record.get("blogger_handle") or record.get("blogger_url", ""))
         scenarios = result.get("scenarios", [])
         patterns = result.get("patterns", [])
 
-        manager_chip = f'<span class="history-chip">👤 {record.get("manager", "")}</span>' if show_manager else ""
+        manager_chip = f'<span class="history-chip">👤 {html.escape(record.get("manager", ""))}</span>' if show_manager else ""
         st.markdown(f"""
             <div class="history-card fade-in-container">
                 <div style="display:flex; justify-content:space-between; align-items:flex-start;">
@@ -1721,7 +1584,7 @@ else:
                     <span class="history-chip">🔥 залётных: {record.get("viral_count", 0)}</span>
                     <span class="history-chip">📊 медиана: {int(record.get("median_views") or 0):,}</span>
                     <span class="history-chip">✍️ сценариев: {len(scenarios)}</span>
-                    <span class="history-chip">🤖 {record.get("model_used", "—")}</span>
+                    <span class="history-chip">🤖 {html.escape(record.get("model_used", "—"))}</span>
                 </div>
             </div>
         """, unsafe_allow_html=True)
@@ -1747,7 +1610,7 @@ else:
                 st.info(result["verdict_note"])
             if record.get("product_brief"):
                 st.caption(f"Бриф товара на момент анализа: {record['product_brief'][:300]}")
-            st.caption(f"Ссылка: {record.get('blogger_url','')}")
+            st.caption(f"Ссылка: {html.escape(record.get('blogger_url',''))}")
 
             if allow_delete:
                 if st.button("🗑 Удалить эту запись", key=f"del_{record['id']}"):
@@ -1846,7 +1709,7 @@ else:
                 st.markdown(f"""
                     <div class="history-card fade-in-container">
                         <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                            <div class="history-handle">{mgr_name}</div>
+                            <div class="history-handle">{html.escape(mgr_name)}</div>
                             <div class="history-date">создан: {created}</div>
                         </div>
                         <div>
@@ -1937,7 +1800,7 @@ else:
                         last = (s.get("last_activity") or "").replace("T", " ")[:16]
                         st.markdown(f"""
                             <div class="manager-stat-card fade-in-container" style="margin-bottom:10px;">
-                                <div style="font-size:13px; font-weight:700; margin-bottom:8px;">{s['manager']}</div>
+                                <div style="font-size:13px; font-weight:700; margin-bottom:8px;">{html.escape(s['manager'])}</div>
                                 <div style="font-size:24px; font-weight:800;">{s['total_analyses']}</div>
                                 <div style="font-size:11px; opacity:0.75;">анализов</div>
                                 <div style="font-size:12px; margin-top:8px;">блогеров: <b>{s['unique_bloggers']}</b></div>
@@ -1949,7 +1812,6 @@ else:
                 st.markdown("#### Просмотр по конкретному менеджеру")
                 counts_map = {s["manager"]: s["total_analyses"] for s in stats}
                 all_mgr_names = [m["name"] for m in get_managers(active_only=False)]
-                # добавляем тех, кто есть только в истории (например, удалённых пользователей)
                 for s in stats:
                     if s["manager"] not in all_mgr_names:
                         all_mgr_names.append(s["manager"])
@@ -2016,7 +1878,7 @@ else:
     with tab_new:
         # --- ФОРМА ВВОДА ---
         st.markdown('<div class="fade-in-container">', unsafe_allow_html=True)
-        blogger_url = st.text_input("Ссылка на профиль блогера (Instagram)", placeholder="https://www.instagram.com/example_blogger/")
+        blogger_url = st.text_input("Ссылка на профиль блогера (Instagram)", placeholder="[https://www.instagram.com/example_blogger/](https://www.instagram.com/example_blogger/)")
         product_brief = st.text_area("Бриф о товаре для адаптации в сценарий", value=st.session_state.product_brief_default, height=120)
 
         edited_df = None
@@ -2101,7 +1963,7 @@ else:
                             st.code(json.dumps(apify_debug_raw, ensure_ascii=False, indent=2) if not isinstance(apify_debug_raw, str) else apify_debug_raw, language="json")
 
                 if raw_df is None or apify_debug_error:
-                    pass  # ошибка уже показана выше (нет токена, либо ошибка запроса к Apify) — дальше не идём
+                    pass  # ошибка уже показана выше
                 else:
                     metrics_df, median_views = compute_reels_metrics(raw_df if raw_df is not None else pd.DataFrame(columns=REELS_COLUMNS), active_viral_threshold)
                     valid_count = len(metrics_df)
@@ -2133,7 +1995,6 @@ else:
                                 </div>
                             """, unsafe_allow_html=True)
 
-                        # если работаем через Apify и включена транскрипция — второй, точечный запрос ТОЛЬКО по топ-роликам
                         if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript
                                 and st.session_state.cfg_apify_token and not top_viral_df.empty):
                             top_links = [l for l in top_viral_df["Ссылка на ролик"].tolist() if l]
@@ -2226,7 +2087,7 @@ else:
                                         result = fallback_result(f"ошибка: {exc}")
                                 except json.JSONDecodeError:
                                     result = fallback_result("не удалось разобрать ответ модели как JSON")
-                                except Exception as exc:  # ошибки сети/авторизации/лимитов API
+                                except Exception as exc:
                                     debug_error_detail = f"{type(exc).__name__}: {exc}"
                                     result = fallback_result(f"ошибка обращения к API: {exc}")
 
@@ -2239,7 +2100,7 @@ else:
 
                         st.markdown(f"""
                             <div class="ai-report-glass fade-in-container">
-                                <b>Общая картина по аудитории:</b><br>{result.get("audience_summary", "")}
+                                <b>Общая картина по аудитории:</b><br>{html.escape(result.get("audience_summary", ""))}
                             </div>
                         """, unsafe_allow_html=True)
 
@@ -2252,9 +2113,9 @@ else:
                                 st.markdown(f"""
                                     <div class="glass-metric fade-in-container" style="margin-bottom: 14px;">
                                         <div class="metric-title">Паттерн</div>
-                                        <div class="metric-value" style="font-size: 16px;">{patt.get("pattern", "")}</div>
-                                        <div class="metric-delta" style="color:#94a3b8;">{patt.get("evidence", "")}</div>
-                                        <span class="pattern-badge {badge_class}">{strength}</span>
+                                        <div class="metric-value" style="font-size: 16px;">{html.escape(patt.get("pattern", ""))}</div>
+                                        <div class="metric-delta" style="color:#94a3b8;">{html.escape(patt.get("evidence", ""))}</div>
+                                        <span class="pattern-badge {badge_class}">{html.escape(strength)}</span>
                                     </div>
                                 """, unsafe_allow_html=True)
 
@@ -2264,14 +2125,14 @@ else:
                             fit_class = {"высокий": "fit-high", "средний": "fit-medium"}.get(fit, "fit-low")
                             st.markdown(f"""
                                 <div class="ai-report-glass fade-in-container">
-                                    <h4 style="margin-top:0;">🎬 {scenario.get("title", "")}
-                                        <span class="{fit_class}" style="float:right; font-size: 14px;">Fit: {fit}</span>
+                                    <h4 style="margin-top:0;">🎬 {html.escape(scenario.get("title", ""))}
+                                        <span class="{fit_class}" style="float:right; font-size: 14px;">Fit: {html.escape(fit)}</span>
                                     </h4>
-                                    <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {scenario.get("based_on_pattern", "—")}</p>
+                                    <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {html.escape(scenario.get("based_on_pattern", "—"))}</p>
                                     <hr style="border-color: rgba(255,255,255,0.1);">
-                                    <p><b>Хук:</b> {scenario.get("hook", "")}</p>
-                                    <p><b>Сценарий:</b><br>{str(scenario.get("script", "")).replace(chr(10), "<br>")}</p>
-                                    <p><b>Подпись к посту:</b> {scenario.get("caption", "")}</p>
+                                    <p><b>Хук:</b> {html.escape(scenario.get("hook", ""))}</p>
+                                    <p><b>Сценарий:</b><br>{str(html.escape(scenario.get("script", ""))).replace(chr(10), "<br>")}</p>
+                                    <p><b>Подпись к посту:</b> {html.escape(scenario.get("caption", ""))}</p>
                                 </div>
                             """, unsafe_allow_html=True)
 
@@ -2279,12 +2140,11 @@ else:
                             st.markdown(f"""
                                 <div class="custom-warning fade-in-container">
                                     <i class="fa-solid fa-circle-info" style="font-size: 18px;"></i>
-                                    {result.get("verdict_note")}
+                                    {html.escape(result.get("verdict_note"))}
                                 </div>
                             """, unsafe_allow_html=True)
 
                         # --- СОХРАНЕНИЕ В ИСТОРИЮ МЕНЕДЖЕРА ---
-                        # сохраняем только осмысленные результаты, а не заглушки при ошибке ИИ
                         if result.get("scenarios") and not str(result.get("audience_summary", "")).startswith("Не удалось"):
                             saved_id = save_analysis(
                                 manager=selected_manager,
