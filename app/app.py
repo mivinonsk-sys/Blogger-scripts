@@ -412,6 +412,9 @@ try {{
 
 # ============================================================================
 # ХРАНИЛИЩЕ ДАННЫХ (SQLite)
+# ВНИМАНИЕ: На бесплатных серверах вроде Streamlit Community Cloud эта БД 
+# обнуляется при перезапуске (засыпании) сервера. Для продакшена используйте 
+# внешнее облачное хранилище.
 # ============================================================================
 DB_PATH = Path(__file__).parent / "blogger_analyses.db"
 
@@ -662,7 +665,7 @@ DEFAULT_SYSTEM_PROMPT = (
     "7. Brand Safety & Fit: если продукт концептуально разрушает образ блогера и ни один формат не "
     "подходит — прямо блокируй интеграцию в verdict_note, без компромиссов и притягивания форматов за уши.\n\n"
     "Отвечай СТРОГО в формате валидного JSON. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: markdown-разметка (никаких "
-    "```json), пояснения до или после кода, обратные кавычки. Только чистый JSON на русском языке.\n"
+    "кодовых блоков), пояснения до или после кода. Только чистый JSON на русском языке.\n"
     "Схема:\n"
     "{\n"
     '  "audience_summary": "строка (включая заметку о сдвиге трендов, если он есть в свежих роликах)",\n'
@@ -685,7 +688,7 @@ if "manager_logged_in" not in st.session_state:
 # Загружаем настройки из БД для всех пользователей один раз при старте сессии
 if "settings_loaded" not in st.session_state:
     st.session_state.cfg_ai_provider_mode = load_setting_str("cfg_ai_provider_mode", "openrouter")
-    st.session_state.cfg_ai_base_url = load_setting_str("cfg_ai_base_url", "[https://openrouter.ai/api/v1](https://openrouter.ai/api/v1)")
+    st.session_state.cfg_ai_base_url = load_setting_str("cfg_ai_base_url", "https://openrouter.ai/api/v1")
     st.session_state.cfg_ai_key = load_setting_str("cfg_ai_key", "")
     st.session_state.cfg_ai_model = load_setting_str("cfg_ai_model", "anthropic/claude-sonnet-5")
     st.session_state.cfg_max_tokens = load_setting_int("cfg_max_tokens", 3000)
@@ -846,9 +849,9 @@ if "reels_data" not in st.session_state:
 
 def build_test_dataframe():
     rows = [
-        ("[instagram.com/reel/demo1](https://instagram.com/reel/demo1)", 210000, 15200, 810, 4100, "2026-05-02", "Примерка нескольких образов подряд под трендовый звук", ""),
-        ("[instagram.com/reel/demo2](https://instagram.com/reel/demo2)", 45000, 1800, 90, 320, "2026-05-06", "Обзор ткани и посадки одного изделия", ""),
-        ("[instagram.com/reel/demo3](https://instagram.com/reel/demo3)", 320000, 28000, 1450, 9200, "2026-05-10", "Юмористический скетч в примерочной с подругой", ""),
+        ("instagram.com/reel/demo1", 210000, 15200, 810, 4100, "2026-05-02", "Примерка нескольких образов подряд под трендовый звук", ""),
+        ("instagram.com/reel/demo2", 45000, 1800, 90, 320, "2026-05-06", "Обзор ткани и посадки одного изделия", ""),
+        ("instagram.com/reel/demo3", 320000, 28000, 1450, 9200, "2026-05-10", "Юмористический скетч в примерочной с подругой", ""),
     ]
     return pd.DataFrame(rows, columns=REELS_COLUMNS)
 
@@ -862,7 +865,7 @@ def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_da
                            include_transcript=False, skip_pinned=True, skip_trial=True, timeout=300):
     if httpx is None: raise RuntimeError("Библиотека httpx не установлена")
     actor_path = actor.strip("/").replace("/", "~")
-    url = f"[https://api.apify.com/v2/acts/](https://api.apify.com/v2/acts/){actor_path}/run-sync-get-dataset-items?token={token}"
+    url = f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items?token={token}"
     body = {"username": targets, "skipPinnedPosts": skip_pinned, "skipTrialReels": skip_trial, "includeTranscript": include_transcript}
     if results_limit: body["resultsLimit"] = results_limit
     if lookback_days: body["onlyPostsNewerThan"] = f"{lookback_days} days"
@@ -891,7 +894,816 @@ def apify_items_to_dataframe(items):
 
 def strip_json_fences(text: str) -> str:
     text = text.strip()
-    if text.startswith("```"):
+    if text.startswith('`' * 3):
         text = text.split("\n", 1)[1] if "\n" in text else text
-        if text.rstrip().endswith("
-http://googleusercontent.com/immersive_entry_chip/0
+        if text.rstrip().endswith('`' * 3):
+            text = text.rstrip()[:-3]
+    return text.strip()
+
+def compute_reels_metrics(df: pd.DataFrame, viral_threshold: float = 3.0):
+    clean = df.copy()
+    clean = clean[clean["Ссылка на ролик"].astype(str).str.strip() != ""]
+    clean["Просмотры"] = pd.to_numeric(clean["Просмотры"], errors="coerce").fillna(0)
+    clean["Лайки"] = pd.to_numeric(clean["Лайки"], errors="coerce").fillna(0)
+    clean["Комментарии"] = pd.to_numeric(clean["Комментарии"], errors="coerce").fillna(0)
+    clean["Сохранения"] = pd.to_numeric(clean["Сохранения"], errors="coerce").fillna(0)
+    valid_views = [v for v in clean["Просмотры"].tolist() if v > 0]
+    median_views = statistics.median(valid_views) if valid_views else 0
+
+    def er_pct(row):
+        if row["Просмотры"] <= 0: return 0.0
+        return round((row["Лайки"] + row["Комментарии"] + row["Сохранения"]) / row["Просмотры"] * 100, 2)
+    def perf_index(row):
+        if median_views <= 0 or row["Просмотры"] <= 0: return None
+        return round(row["Просмотры"] / median_views, 2)
+
+    clean["ER_%"] = clean.apply(er_pct, axis=1)
+    clean["Индекс_к_медиане"] = clean.apply(perf_index, axis=1)
+    clean["Аномалия"] = clean["Индекс_к_медиане"].apply(lambda x: bool(x and x >= viral_threshold))
+    return clean, median_views
+
+def select_top_viral(metrics_df: pd.DataFrame, threshold: float, top_n: int):
+    qualifying = metrics_df[metrics_df["Индекс_к_медиане"].apply(lambda x: bool(x and x >= threshold))]
+    qualifying = qualifying.sort_values("Индекс_к_медиане", ascending=False)
+    if qualifying.empty:
+        return metrics_df.sort_values("Просмотры", ascending=False).head(top_n), False
+    return qualifying.head(top_n), True
+
+def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df=None):
+    table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
+    viral_block = ""
+    if top_viral_df is not None and not top_viral_df.empty:
+        viral_records = top_viral_df.to_dict(orient="records")
+        viral_block = (
+            f"\n\nТоп-{len(viral_records)} самых залётных роликов ЭТОГО блогера "
+            f"(здесь есть поле 'Транскрипция (если есть)' — используй именно его для разбора хука и структуры):\n"
+            f"{json.dumps(viral_records, ensure_ascii=False, indent=2)}"
+        )
+    return (
+        f"Блогер: {blogger_url}\nМедиана просмотров: {median_views:.0f}\nНужно сценариев: {n_scenarios}\n\n"
+        f"Бриф о товаре:\n{product_brief}\n\nВсе загруженные ролики:\n"
+        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}"
+    )
+
+def fallback_result(reason: str):
+    return {
+        "audience_summary": f"Не удалось получить ответ от ИИ ({reason}). Ниже — заглушка.",
+        "patterns": [{"pattern": "Заглушка", "evidence": "демо", "strength": "предварительная"}],
+        "scenarios": [{"title": "Демо-сценарий", "based_on_pattern": "—", "hook": "Настройте API-ключ OpenRouter", "script": "—", "caption": "—", "ad_marking_note": "Реклама.", "fit_score": "средний"}],
+        "verdict_note": "Заполните ключ ИИ-помощника в настройках.",
+    }
+
+
+PIN_LENGTH = 4
+
+def render_pin_pad(form_key: str, title: str, subtitle: str):
+    st.markdown(f"""
+        <div class="pin-wrap fade-in-container">
+            <div class="pin-title">{html.escape(title)}</div>
+            <div class="pin-subtitle">{html.escape(subtitle)}</div>
+        </div>
+    """, unsafe_allow_html=True)
+    col_l, col_c, col_r = st.columns([1, 2, 1])
+    with col_c:
+        with st.form(form_key):
+            st.markdown('<div class="pin-single">', unsafe_allow_html=True)
+            pin_value = st.text_input("PIN", max_chars=PIN_LENGTH, type="password", key=f"{form_key}_pin", label_visibility="collapsed")
+            st.markdown('</div>', unsafe_allow_html=True)
+            submitted = st.form_submit_button("🔓 Войти", use_container_width=True, type="primary")
+    return submitted, (pin_value or "").strip()
+
+def play_success_animation(message="Доступ разрешён"):
+    components.html(f"""
+    <div id="anim-root" style="display:flex;align-items:center;justify-content:center;height:220px;font-family:'Plus Jakarta Sans',system-ui,sans-serif;">
+      <div id="pac-stage" style="position:relative;width:280px;height:60px;display:flex;align-items:center;justify-content:center;">
+        <div style="position:absolute;display:flex;gap:32px;">
+          <div class="dot" style="animation-delay:0.35s"></div><div class="dot" style="animation-delay:0.75s"></div>
+          <div class="dot" style="animation-delay:1.15s"></div><div class="dot" style="animation-delay:1.55s"></div>
+        </div>
+        <div id="pacman"><div class="pac-body"></div></div>
+      </div>
+      <div id="success-stage" style="display:none;flex-direction:column;align-items:center;text-align:center;">
+        <div style="position:relative;margin-bottom:18px;">
+          <div class="ring"></div>
+          <div class="check-circle"><svg width="34" height="34" viewBox="0 0 24 24" fill="none" stroke="#052e16" stroke-width="3.2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"></polyline></svg></div>
+        </div>
+        <div style="font-size:20px;font-weight:800;color:#0a3a5c;margin-bottom:4px;">{html.escape(message)}</div>
+      </div>
+    </div>
+    <style>
+      .dot {{ width:14px;height:14px;background:#0a8ed9;border-radius:50%; animation: dotEaten 0.12s linear forwards; }}
+      @keyframes dotEaten {{ to {{ opacity:0; transform:scale(0.2); }} }}
+      #pacman {{ position:absolute; animation: pacMove 2s linear forwards; }}
+      @keyframes pacMove {{ from {{ transform: translateX(-135px); }} to {{ transform: translateX(135px); }} }}
+      .pac-body {{ width:0;height:0;border-radius:50%; border:22px solid #facc15; border-right-color:transparent; animation: chomp 0.32s infinite; }}
+      @keyframes chomp {{ 0%,100% {{ border-right-color: transparent; }} 50% {{ border-right-color: #facc15; }} }}
+      .check-circle {{ width:76px;height:76px;background:#10b981;border-radius:50%; display:flex;align-items:center;justify-content:center;position:relative;z-index:2; animation: popIn 0.45s cubic-bezier(0.34,1.56,0.64,1) forwards; }}
+      @keyframes popIn {{ from {{ transform:scale(0); }} 60% {{ transform:scale(1.15); }} to {{ transform:scale(1); }} }}
+      .ring {{ position:absolute;inset:0;background:#10b981;border-radius:50%;z-index:1; animation: ringOut 0.85s ease-out forwards; }}
+      @keyframes ringOut {{ from {{ transform:scale(0.6); opacity:0.85; }} to {{ transform:scale(2.2); opacity:0; }} }}
+    </style>
+    <script>
+      setTimeout(function() {{ document.getElementById('pac-stage').style.display = 'none'; document.getElementById('success-stage').style.display = 'flex'; }}, 2000);
+    </script>
+    """, height=240)
+
+
+def save_analysis(manager, blogger_url, blogger_handle, data_source, model_used,
+                  reels_count, median_views, viral_count, product_brief,
+                  metrics_df, top_viral_df, result):
+    try:
+        with db_connect() as conn:
+            cur = conn.execute("""
+                INSERT INTO analyses (manager, blogger_url, blogger_handle, created_at, data_source,
+                                      model_used, reels_count, median_views, viral_count, product_brief,
+                                      metrics_json, top_viral_json, result_json)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """, (
+                manager, blogger_url, blogger_handle, datetime.now().isoformat(timespec="seconds"),
+                data_source, model_used, int(reels_count), int(median_views), int(viral_count),
+                product_brief,
+                metrics_df.to_json(orient="records", force_ascii=False) if metrics_df is not None else "[]",
+                top_viral_df.to_json(orient="records", force_ascii=False) if top_viral_df is not None else "[]",
+                json.dumps(result, ensure_ascii=False),
+            ))
+            return cur.lastrowid
+    except Exception:
+        return None
+
+def get_analyses(manager=None, limit=500):
+    try:
+        with db_connect() as conn:
+            if manager:
+                rows = conn.execute("SELECT * FROM analyses WHERE manager = ? ORDER BY created_at DESC LIMIT ?", (manager, limit)).fetchall()
+            else:
+                rows = conn.execute("SELECT * FROM analyses ORDER BY created_at DESC LIMIT ?", (limit,)).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+def get_manager_stats():
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("""
+                SELECT manager, COUNT(*) AS total_analyses, COUNT(DISTINCT blogger_handle) AS unique_bloggers, MAX(created_at) AS last_activity
+                FROM analyses GROUP BY manager ORDER BY total_analyses DESC
+            """).fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+def delete_analysis(analysis_id):
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM analyses WHERE id = ?", (analysis_id,))
+        return True
+    except Exception:
+        return False
+
+
+# ============================================================================
+# ШАПКА И АВТОРИЗАЦИЯ
+# ============================================================================
+top_col1, top_col2 = st.columns([3, 1.2])
+with top_col1:
+    accent = '#38bdf8' if theme_class == 'theme-night' else '#0284c7'
+    st.markdown(f"### <i class='fa-solid fa-clapperboard' style='color: {accent};'></i> Анализ роликов блогера", unsafe_allow_html=True)
+with top_col2:
+    db_managers = get_managers(active_only=True)
+    managers_list = ["Выберите пользователя...", "👑 Администратор"] + [m["name"] for m in db_managers]
+    selected_manager = st.selectbox("Пользователь", managers_list, label_visibility="collapsed")
+
+
+if selected_manager == "👑 Администратор" and not st.session_state.admin_logged_in:
+    submitted, entered_pin = render_pin_pad("admin_pin_form", "Вход администратора", f"Введите {PIN_LENGTH}-значный PIN.")
+    if submitted:
+        if len(entered_pin) < PIN_LENGTH: st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
+        elif verify_admin_pin(entered_pin):
+            play_success_animation("Доступ разрешён")
+            time.sleep(2.9)
+            st.session_state.admin_logged_in = True
+            st.rerun()
+        else: st.error("Неверный PIN! Попробуйте ещё раз.")
+
+elif selected_manager == "Выберите пользователя...":
+    st.session_state.admin_logged_in = False
+    st.session_state.manager_logged_in = None
+    st.markdown("""
+        <div class="fade-in-container">
+            <div class="custom-warning">
+                <i class="fa-solid fa-triangle-exclamation" style="font-size: 18px;"></i> Пожалуйста, выберите ваше имя в верхнем меню, чтобы начать работу.
+            </div>
+        </div>
+    """, unsafe_allow_html=True)
+
+elif (selected_manager != "👑 Администратор"
+      and (get_manager(selected_manager) or {}).get("password_hash")
+      and st.session_state.get("manager_logged_in") != selected_manager):
+    st.session_state.admin_logged_in = False
+    submitted, entered_pin = render_pin_pad("manager_pin_form", f"Вход: {html.escape(selected_manager)}", f"Для этого пользователя администратор задал {PIN_LENGTH}-значный PIN.")
+    if submitted:
+        mrec = get_manager(selected_manager) or {}
+        if len(entered_pin) < PIN_LENGTH: st.warning(f"Введите все {PIN_LENGTH} цифры PIN-кода.")
+        elif verify_password(entered_pin, mrec.get("password_hash"), mrec.get("salt")):
+            play_success_animation("Доступ разрешён")
+            time.sleep(2.9)
+            st.session_state.manager_logged_in = selected_manager
+            st.rerun()
+        else: st.error("Неверный PIN! Попробуйте ещё раз.")
+
+else:
+    if selected_manager != "👑 Администратор":
+        st.session_state.admin_logged_in = False
+
+    is_admin = (selected_manager == "👑 Администратор" and st.session_state.admin_logged_in)
+
+    accent = '#38bdf8' if theme_class == 'theme-night' else '#0284c7'
+    st.markdown(f"""
+        <div class="fade-in-container">
+            <p style='margin-top: -5px; margin-bottom: 20px; font-weight: 600;'>
+                <i class='fa-solid fa-user-shield'></i> Вы зашли как: <b style='color: {accent};'>{html.escape(selected_manager)}</b> | Режим: <b>{st.session_state.theme_mode}</b>
+            </p>
+        </div>
+    """, unsafe_allow_html=True)
+
+    if is_admin and st.sidebar.button("🔒 Выйти из аккаунта", use_container_width=True):
+        st.session_state.admin_logged_in = False
+        st.rerun()
+
+    # ============================================================================
+    # БОКОВАЯ ПАНЕЛЬ С ГЛОБАЛЬНЫМ СОХРАНЕНИЕМ (ДЛЯ АДМИНА)
+    # ============================================================================
+    st.sidebar.markdown("### <i class='fa-solid fa-key'></i> Настройки ИИ-помощника", unsafe_allow_html=True)
+
+    if is_admin:
+        provider_mode_labels = {"openrouter": "OpenRouter (много моделей)", "gemini": "Google Gemini (AI Studio)", "anthropic_direct": "Anthropic напрямую"}
+        provider_presets = {
+            "openrouter": {"base_url": "https://openrouter.ai/api/v1", "key_label": "API-ключ (OpenRouter)", "key_help": "openrouter.ai/workspaces/default/keys"},
+            "gemini": {"base_url": "https://generativelanguage.googleapis.com/v1beta/openai/", "key_label": "API-ключ (Google AI Studio / Gemini)", "key_help": "aistudio.google.com/api-keys"},
+        }
+        provider_mode_input = st.sidebar.selectbox("Способ вызова ИИ", list(provider_mode_labels.keys()), index=list(provider_mode_labels.keys()).index(st.session_state.cfg_ai_provider_mode), format_func=lambda k: provider_mode_labels[k])
+
+        if provider_mode_input == "anthropic_direct":
+            ai_key_input = st.sidebar.text_input("API-ключ Anthropic", value=st.session_state.cfg_ai_key, type="password")
+            direct_model_options = ["claude-sonnet-5", "claude-opus-4-8", "claude-haiku-4-5-20251001", "claude-fable-5"]
+            ai_model_input = st.sidebar.selectbox("Модель", direct_model_options, index=direct_model_options.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in direct_model_options else 0)
+            ai_base_url_input = "https://api.anthropic.com"
+        else:
+            preset = provider_presets[provider_mode_input]
+            default_base_url = st.session_state.cfg_ai_base_url if st.session_state.cfg_ai_provider_mode == provider_mode_input else preset["base_url"]
+            ai_base_url_input = st.sidebar.text_input("Base URL API", value=default_base_url, help=f"По умолчанию: {preset['base_url']}")
+            ai_key_input = st.sidebar.text_input(preset["key_label"], value=st.session_state.cfg_ai_key, type="password", help=preset["key_help"])
+            
+            if st.sidebar.button(f"🔄 Обновить список моделей ({provider_mode_labels[provider_mode_input]})", use_container_width=True):
+                try:
+                    fetched = fetch_openai_compatible_models(ai_base_url_input, ai_key_input)
+                    if provider_mode_input == "gemini": fetched = apply_gemini_free_tier_guess(fetched)
+                    st.session_state.available_models = fetched
+                    st.sidebar.success(f"Загружено моделей: {len(st.session_state.available_models)}")
+                except Exception as exc:
+                    st.sidebar.error(f"Не удалось получить список: {exc}")
+
+            starter_catalog = STARTER_MODEL_CATALOG if provider_mode_input == "openrouter" else GEMINI_STARTER_CATALOG
+            model_catalog = st.session_state.available_models or starter_catalog
+
+            model_choices = [MANUAL_MODEL_OPTION] + model_catalog
+            current_ids = [m["id"] for m in model_choices]
+            default_index = current_ids.index(st.session_state.cfg_ai_model) if st.session_state.cfg_ai_model in current_ids else 0
+
+            def _format_model_option(m):
+                if m["id"] == "__manual__": return m["name"]
+                free_icon = '🆓' if m['is_free'] is True else ('💰' if m['is_free'] is False else '•')
+                return f"{free_icon} {m['id']}"
+
+            selected_model_entry = st.sidebar.selectbox("Модель", model_choices, index=default_index, format_func=_format_model_option)
+            if selected_model_entry["id"] == "__manual__":
+                ai_model_input = st.sidebar.text_input("Свой слаг модели", value=st.session_state.cfg_ai_model)
+            else:
+                ai_model_input = selected_model_entry["id"]
+
+        max_tokens_input = st.sidebar.number_input("Лимит токенов ответа (max_tokens)", min_value=500, max_value=8000, value=st.session_state.cfg_max_tokens, step=100)
+        st.sidebar.markdown("---")
+
+        st.sidebar.markdown("### <i class='fa-solid fa-video'></i> Сбор роликов", unsafe_allow_html=True)
+        data_source_labels = {"apify": "🤖 Автоматически через Apify", "manual": "✍️ Вручную (таблица)"}
+        data_source_input = st.sidebar.selectbox("Источник данных", list(data_source_labels.keys()), index=list(data_source_labels.keys()).index(st.session_state.cfg_data_source_mode), format_func=lambda k: data_source_labels[k])
+        
+        if data_source_input == "apify":
+            apify_token_input = st.sidebar.text_input("Apify API-токен", value=st.session_state.cfg_apify_token, type="password")
+            apify_actor_input = st.sidebar.text_input("Актор Apify", value=st.session_state.cfg_apify_actor)
+            results_limit_input = st.sidebar.number_input("Роликов с профиля за раз", min_value=5, max_value=100, value=st.session_state.cfg_results_limit, step=5)
+            lookback_days_input = st.sidebar.number_input("Глубина в днях", min_value=7, max_value=90, value=st.session_state.cfg_lookback_days, step=1)
+            include_transcript_input = st.sidebar.checkbox("Включить реальную транскрипцию", value=st.session_state.cfg_include_transcript)
+        else:
+            apify_token_input = st.session_state.cfg_apify_token
+            apify_actor_input = st.session_state.cfg_apify_actor
+            results_limit_input = st.session_state.cfg_results_limit
+            lookback_days_input = st.session_state.cfg_lookback_days
+            include_transcript_input = st.session_state.cfg_include_transcript
+
+        viral_threshold_input = st.sidebar.slider("Порог «залётности» (× медианы)", 1.5, 5.0, float(st.session_state.cfg_viral_threshold), 0.1)
+        top_n_viral_input = st.sidebar.slider("Топ-N залётных роликов", 1, 6, st.session_state.cfg_top_n_viral)
+        st.sidebar.markdown("---")
+        min_reels_input = st.sidebar.number_input("Мин. роликов для надёжного анализа", min_value=3, max_value=30, value=st.session_state.min_reels_required, step=1)
+        scenarios_count_input = st.sidebar.slider("Сколько сценариев генерировать", 2, 6, st.session_state.scenarios_count)
+        st.sidebar.markdown("---")
+        product_brief_input = st.sidebar.text_area("Бриф о товаре по умолчанию", value=st.session_state.product_brief_default, height=160)
+        st.sidebar.markdown("---")
+        system_prompt_input = st.sidebar.text_area("Системный промпт для ИИ", value=st.session_state.system_prompt_cfg, height=220)
+
+        # СОХРАНЕНИЕ В БАЗУ ДАННЫХ ДЛЯ ВСЕХ МЕНЕДЖЕРОВ
+        if st.sidebar.button("💾 Сохранить глобально", use_container_width=True, type="primary"):
+            st.session_state.cfg_ai_provider_mode = provider_mode_input
+            st.session_state.cfg_ai_base_url = ai_base_url_input
+            st.session_state.cfg_ai_key = ai_key_input
+            st.session_state.cfg_ai_model = ai_model_input
+            st.session_state.cfg_max_tokens = max_tokens_input
+            st.session_state.cfg_data_source_mode = data_source_input
+            st.session_state.cfg_apify_token = apify_token_input
+            st.session_state.cfg_apify_actor = apify_actor_input
+            st.session_state.cfg_results_limit = results_limit_input
+            st.session_state.cfg_lookback_days = lookback_days_input
+            st.session_state.cfg_include_transcript = include_transcript_input
+            st.session_state.cfg_viral_threshold = viral_threshold_input
+            st.session_state.cfg_top_n_viral = top_n_viral_input
+            st.session_state.min_reels_required = min_reels_input
+            st.session_state.scenarios_count = scenarios_count_input
+            st.session_state.product_brief_default = product_brief_input
+            st.session_state.system_prompt_cfg = system_prompt_input
+
+            set_setting("cfg_ai_provider_mode", provider_mode_input)
+            set_setting("cfg_ai_base_url", ai_base_url_input)
+            set_setting("cfg_ai_key", ai_key_input)
+            set_setting("cfg_ai_model", ai_model_input)
+            set_setting("cfg_max_tokens", str(max_tokens_input))
+            set_setting("cfg_data_source_mode", data_source_input)
+            set_setting("cfg_apify_token", apify_token_input)
+            set_setting("cfg_apify_actor", apify_actor_input)
+            set_setting("cfg_results_limit", str(results_limit_input))
+            set_setting("cfg_lookback_days", str(lookback_days_input))
+            set_setting("cfg_include_transcript", str(include_transcript_input))
+            set_setting("cfg_viral_threshold", str(viral_threshold_input))
+            set_setting("cfg_top_n_viral", str(top_n_viral_input))
+            set_setting("min_reels_required", str(min_reels_input))
+            set_setting("scenarios_count", str(scenarios_count_input))
+            set_setting("product_brief_default", product_brief_input)
+            set_setting("system_prompt_cfg", system_prompt_input)
+            
+            st.sidebar.success("✅ Сохранено глобально! Доступно всем менеджерам.")
+    else:
+        st.sidebar.info("🔒 Настройки может менять только Администратор.")
+        st.sidebar.markdown(f"🤖 **Модель:** `{st.session_state.cfg_ai_model}`")
+        st.sidebar.markdown(f"📥 **Источник данных:** {'Apify (авто)' if st.session_state.cfg_data_source_mode == 'apify' else 'Вручную'}")
+        st.sidebar.markdown(f"📏 **Мин. роликов:** {st.session_state.min_reels_required}")
+        st.sidebar.markdown(f"🧩 **Сценариев за раз:** {st.session_state.scenarios_count}")
+
+    active_provider_mode = st.session_state.cfg_ai_provider_mode
+    active_base_url = st.session_state.cfg_ai_base_url
+    active_model = st.session_state.cfg_ai_model
+    active_max_tokens = st.session_state.cfg_max_tokens
+    active_system_prompt = st.session_state.system_prompt_cfg
+    active_min_reels = st.session_state.min_reels_required
+    active_scenarios_count = st.session_state.scenarios_count
+    active_data_source_mode = st.session_state.cfg_data_source_mode
+    active_viral_threshold = st.session_state.cfg_viral_threshold
+    active_top_n_viral = st.session_state.cfg_top_n_viral
+
+    def extract_instagram_username(url_or_username: str) -> str:
+        text = (url_or_username or "").strip()
+        if not text: return text
+        if "instagram.com" not in text: return text.lstrip("@")
+        tail = text.split("instagram.com/")[-1].split("?")[0]
+        return tail.strip("/").split("/")[0]
+
+    def render_saved_analysis(record, show_manager=False, allow_delete=False):
+        try:
+            result = json.loads(record.get("result_json") or "{}")
+        except json.JSONDecodeError:
+            result = {}
+        created = (record.get("created_at") or "").replace("T", " ")
+        handle = html.escape(record.get("blogger_handle") or record.get("blogger_url", ""))
+        scenarios = result.get("scenarios", [])
+        patterns = result.get("patterns", [])
+
+        manager_chip = f'<span class="history-chip">👤 {html.escape(record.get("manager", ""))}</span>' if show_manager else ""
+        st.markdown(f"""
+            <div class="history-card fade-in-container">
+                <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                    <div class="history-handle">@{handle}</div>
+                    <div class="history-date">{created}</div>
+                </div>
+                <div>
+                    {manager_chip}
+                    <span class="history-chip">🎬 роликов: {record.get("reels_count", 0)}</span>
+                    <span class="history-chip">🔥 залётных: {record.get("viral_count", 0)}</span>
+                    <span class="history-chip">📊 медиана: {int(record.get("median_views") or 0):,}</span>
+                    <span class="history-chip">✍️ сценариев: {len(scenarios)}</span>
+                    <span class="history-chip">🤖 {html.escape(record.get("model_used", "—"))}</span>
+                </div>
+            </div>
+        """, unsafe_allow_html=True)
+
+        with st.expander(f"Открыть разбор и сценарии — @{handle} от {created}"):
+            if result.get("audience_summary"):
+                st.markdown(f"**Аудитория:** {result['audience_summary']}")
+            if patterns:
+                st.markdown("**Найденные паттерны:**")
+                for p in patterns:
+                    st.markdown(f"- **{p.get('pattern','')}** — {p.get('evidence','')} _({p.get('strength','')})_")
+            if scenarios:
+                st.markdown("**Сценарии:**")
+                for s in scenarios:
+                    st.markdown(
+                        f"**🎬 {s.get('title','')}** _(fit: {s.get('fit_score','—')})_\n\n"
+                        f"*На основе:* {s.get('based_on_pattern','—')}\n\n"
+                        f"**Хук:** {s.get('hook','')}\n\n"
+                        f"**Сценарий:** {s.get('script','')}\n\n"
+                        f"**Подпись:** {s.get('caption','')}\n\n---"
+                    )
+            if result.get("verdict_note"):
+                st.info(result["verdict_note"])
+            if record.get("product_brief"):
+                st.caption(f"Бриф товара на момент анализа: {record['product_brief'][:300]}")
+            st.caption(f"Ссылка: {html.escape(record.get('blogger_url',''))}")
+
+            if allow_delete:
+                if st.button("🗑 Удалить эту запись", key=f"del_{record['id']}"):
+                    if delete_analysis(record["id"]):
+                        st.success("Запись удалена — обновите вкладку.")
+                    else:
+                        st.error("Не удалось удалить запись.")
+
+    # --- ВКЛАДКИ ---
+    if is_admin:
+        tab_new, tab_history, tab_editor = st.tabs(["🚀 Новый анализ", "📚 История по менеджерам", "👥 Редактор менеджеров"])
+    else:
+        tab_new, tab_history = st.tabs(["🚀 Новый анализ", "📚 Мои блогеры"])
+        tab_editor = None
+
+    if tab_editor is not None:
+        with tab_editor:
+            st.markdown("#### 👑 PIN администратора")
+            if admin_pin_is_default():
+                st.warning("Сейчас действует начальный PIN из кода. Смените его — иначе доступ к настройкам и данным всех менеджеров открыт любому.")
+            else:
+                st.caption("PIN администратора задан и хранится в базе в виде хеша.")
+
+            ac1, ac2, ac3 = st.columns([1, 2, 1])
+            with ac2:
+                with st.form("admin_pin_change_form"):
+                    cur_pin = st.text_input("Текущий PIN", type="password", max_chars=PIN_LENGTH, placeholder="••••")
+                    new_admin_pin = st.text_input("Новый PIN", type="password", max_chars=PIN_LENGTH, placeholder="••••")
+                    new_admin_pin2 = st.text_input("Повторите новый PIN", type="password", max_chars=PIN_LENGTH, placeholder="••••")
+                    if st.form_submit_button("💾 Сохранить новый PIN", use_container_width=True, type="primary"):
+                        if not verify_admin_pin(cur_pin): st.error("Текущий PIN введён неверно.")
+                        elif len(new_admin_pin) != PIN_LENGTH or not new_admin_pin.isdigit(): st.error(f"Новый PIN должен состоять ровно из {PIN_LENGTH} цифр.")
+                        elif new_admin_pin != new_admin_pin2: st.error("Новый PIN и повтор не совпадают.")
+                        else:
+                            ok, msg = set_admin_pin(new_admin_pin)
+                            if ok: st.success(msg + " При следующем входе используйте новый PIN.")
+                            else: st.error(msg)
+
+            st.markdown("---")
+            st.markdown("#### Управление пользователями")
+            st.caption("PIN необязателен: если он не задан, вход под этим именем свободный.")
+            all_managers = get_managers(active_only=False)
+
+            with st.expander("➕ Добавить нового менеджера", expanded=False):
+                with st.form("add_manager_form"):
+                    new_mgr_name = st.text_input("Имя менеджера", placeholder="Иван Иванов")
+                    new_mgr_pw = st.text_input(f"PIN из {PIN_LENGTH} цифр (можно оставить пустым)", type="password", max_chars=PIN_LENGTH, placeholder="0000")
+                    add_submit = st.form_submit_button("💾 Сохранить нового менеджера", use_container_width=True, type="primary")
+                    if add_submit:
+                        if new_mgr_pw and (len(new_mgr_pw) != PIN_LENGTH or not new_mgr_pw.isdigit()):
+                            st.error(f"PIN должен состоять ровно из {PIN_LENGTH} цифр (или оставьте поле пустым).")
+                        else:
+                            ok, msg = add_manager(new_mgr_name, new_mgr_pw or None)
+                            if ok:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
+            st.markdown("---")
+            st.markdown(f"#### Текущие менеджеры ({len(all_managers)})")
+
+            for mgr in all_managers:
+                mgr_name = mgr["name"]
+                has_pw = bool(mgr.get("password_hash"))
+                analyses_cnt = count_manager_analyses(mgr_name)
+                created = (mgr.get("created_at") or "").replace("T", " ")[:16]
+
+                st.markdown(f"""
+                    <div class="history-card fade-in-container">
+                        <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                            <div class="history-handle">{html.escape(mgr_name)}</div>
+                            <div class="history-date">создан: {created}</div>
+                        </div>
+                        <div>
+                            <span class="history-chip">{'🔒 PIN задан' if has_pw else '🔓 без PIN'}</span>
+                            <span class="history-chip">📊 анализов: {analyses_cnt}</span>
+                        </div>
+                    </div>
+                """, unsafe_allow_html=True)
+
+                with st.expander(f"⚙️ Настроить — {mgr_name}"):
+                    ec1, ec2 = st.columns(2)
+                    with ec1:
+                        st.markdown("**PIN-код**")
+                        with st.form(f"pw_form_{mgr['id']}"):
+                            new_pw = st.text_input(f"Новый PIN ({PIN_LENGTH} цифры)", type="password", key=f"pw_{mgr['id']}", max_chars=PIN_LENGTH, placeholder="0000")
+                            if st.form_submit_button("💾 Сохранить PIN", use_container_width=True):
+                                if new_pw and (len(new_pw) != PIN_LENGTH or not new_pw.isdigit()):
+                                    st.error(f"PIN должен состоять ровно из {PIN_LENGTH} цифр.")
+                                else:
+                                    ok, msg = set_manager_password(mgr_name, new_pw or None)
+                                    if ok:
+                                        if st.session_state.get("manager_logged_in") == mgr_name: st.session_state.manager_logged_in = None
+                                        st.success(msg)
+                                        st.rerun()
+                                    else:
+                                        st.error(msg)
+                        st.markdown("**Переименовать**")
+                        with st.form(f"rename_form_{mgr['id']}"):
+                            new_name = st.text_input("Новое имя", value=mgr_name, key=f"rn_{mgr['id']}")
+                            if st.form_submit_button("💾 Сохранить имя", use_container_width=True):
+                                if new_name.strip() == mgr_name: st.info("Имя не изменилось.")
+                                else:
+                                    ok, msg = rename_manager(mgr_name, new_name)
+                                    if ok:
+                                        st.success(msg)
+                                        st.rerun()
+                                    else: st.error(msg)
+                    with ec2:
+                        st.markdown("**Удаление**")
+                        st.caption(f"У этого менеджера {analyses_cnt} сохранённых анализов.")
+                        also_delete_history = st.checkbox("Удалить вместе с историей анализов", key=f"delhist_{mgr['id']}")
+                        confirm_delete = st.checkbox(f"Подтверждаю удаление «{mgr_name}»", key=f"confirm_{mgr['id']}")
+                        if st.button("🗑 Удалить менеджера", key=f"delmgr_{mgr['id']}", use_container_width=True):
+                            if not confirm_delete: st.warning("Отметьте галочку подтверждения — удаление необратимо.")
+                            else:
+                                ok, msg = delete_manager(mgr_name, delete_history=also_delete_history)
+                                if ok:
+                                    st.success(msg)
+                                    st.rerun()
+                                else: st.error(msg)
+
+    with tab_history:
+        if is_admin:
+            stats = get_manager_stats()
+            if not stats:
+                st.markdown("""<div class="empty-state fade-in-container"><div style="font-size:40px; margin-bottom:12px;">📭</div><div style="font-size:15px; font-weight:600;">Пока никто не проводил анализов</div></div>""", unsafe_allow_html=True)
+            else:
+                st.markdown("#### Сводка по менеджерам")
+                cols = st.columns(min(4, len(stats)))
+                for i, s in enumerate(stats):
+                    with cols[i % len(cols)]:
+                        last = (s.get("last_activity") or "").replace("T", " ")[:16]
+                        st.markdown(f"""
+                            <div class="manager-stat-card fade-in-container" style="margin-bottom:10px;">
+                                <div style="font-size:13px; font-weight:700; margin-bottom:8px;">{html.escape(s['manager'])}</div>
+                                <div style="font-size:24px; font-weight:800;">{s['total_analyses']}</div>
+                                <div style="font-size:11px; opacity:0.75;">анализов</div>
+                                <div style="font-size:12px; margin-top:8px;">блогеров: <b>{s['unique_bloggers']}</b></div>
+                                <div style="font-size:11px; opacity:0.7; margin-top:4px;">{last}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
+
+                st.markdown("---")
+                st.markdown("#### Просмотр по конкретному менеджеру")
+                counts_map = {s["manager"]: s["total_analyses"] for s in stats}
+                all_mgr_names = [m["name"] for m in get_managers(active_only=False)]
+                for s in stats:
+                    if s["manager"] not in all_mgr_names: all_mgr_names.append(s["manager"])
+                all_mgr_names.sort()
+
+                filter_options = ["Все менеджеры"] + all_mgr_names
+                chosen_manager = st.selectbox(
+                    "Выберите менеджера", filter_options,
+                    format_func=lambda n: f"Все менеджеры ({sum(counts_map.values())} анализов)" if n == "Все менеджеры" else f"{n} — {counts_map.get(n, 0)} анализов"
+                )
+                records = get_analyses(None if chosen_manager == "Все менеджеры" else chosen_manager)
+                search_q = st.text_input("Поиск по блогеру", placeholder="например: manekenshicca")
+                if search_q.strip():
+                    q = search_q.strip().lower()
+                    records = [r for r in records if q in (r.get("blogger_handle") or "").lower() or q in (r.get("blogger_url") or "").lower()]
+                st.caption(f"Найдено записей: {len(records)}")
+                for rec in records:
+                    render_saved_analysis(rec, show_manager=True, allow_delete=True)
+        else:
+            records = get_analyses(selected_manager)
+            if not records:
+                st.markdown("""<div class="empty-state fade-in-container"><div style="font-size:40px; margin-bottom:12px;">📭</div><div style="font-size:15px; font-weight:600;">Вы пока не анализировали блогеров</div></div>""", unsafe_allow_html=True)
+            else:
+                total_scen = 0
+                for r in records:
+                    try: total_scen += len(json.loads(r.get("result_json") or "{}").get("scenarios", []))
+                    except json.JSONDecodeError: pass
+                unique_bloggers = len({r.get("blogger_handle") for r in records if r.get("blogger_handle")})
+                m1, m2, m3 = st.columns(3)
+                for col, val, label in ((m1, len(records), "анализов"), (m2, unique_bloggers, "блогеров"), (m3, total_scen, "сценариев")):
+                    with col:
+                        st.markdown(f"""
+                            <div class="manager-stat-card fade-in-container" style="margin-bottom:14px;">
+                                <div style="font-size:26px; font-weight:800;">{val}</div>
+                                <div style="font-size:12px; opacity:0.75;">{label}</div>
+                            </div>
+                        """, unsafe_allow_html=True)
+
+                search_q = st.text_input("Поиск по блогеру", placeholder="например: manekenshicca")
+                if search_q.strip():
+                    q = search_q.strip().lower()
+                    records = [r for r in records if q in (r.get("blogger_handle") or "").lower() or q in (r.get("blogger_url") or "").lower()]
+                st.caption(f"Показано записей: {len(records)}")
+                for rec in records:
+                    render_saved_analysis(rec, show_manager=False, allow_delete=False)
+
+    with tab_new:
+        st.markdown('<div class="fade-in-container">', unsafe_allow_html=True)
+        blogger_url = st.text_input("Ссылка на профиль блогера (Instagram)", placeholder="https://www.instagram.com/example_blogger/")
+        product_brief = st.text_area("Бриф о товаре для адаптации в сценарий", value=st.session_state.product_brief_default, height=120)
+
+        edited_df = None
+        if active_data_source_mode == "manual":
+            st.markdown("**Ролики блогера** — заполните вручную:")
+            edited_df = st.data_editor(
+                st.session_state.reels_data, num_rows="dynamic", use_container_width=True, key="reels_editor_widget",
+                column_config={
+                    "Просмотры": st.column_config.NumberColumn(min_value=0, step=100),
+                    "Лайки": st.column_config.NumberColumn(min_value=0, step=10),
+                    "Комментарии": st.column_config.NumberColumn(min_value=0, step=1),
+                    "Сохранения": st.column_config.NumberColumn(min_value=0, step=1),
+                },
+            )
+        else:
+            st.caption(
+                f"🤖 Автоматический сбор через Apify ({st.session_state.cfg_apify_actor}). "
+                f"До {st.session_state.cfg_results_limit} роликов за последние {st.session_state.cfg_lookback_days} дн. "
+                + ("Транскрипция включена." if st.session_state.cfg_include_transcript else "Транскрипция выключена.")
+            )
+
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1: submit_btn = st.button("🚀 Проанализировать ролики", use_container_width=True)
+        with btn_col2: test_btn = st.button("🧪 Заполнить тестовыми роликами", use_container_width=True) if active_data_source_mode == "manual" else False
+        st.markdown('</div>', unsafe_allow_html=True)
+
+        if test_btn:
+            st.session_state.reels_data = build_test_dataframe()
+            if "reels_editor_widget" in st.session_state: del st.session_state["reels_editor_widget"]
+            st.rerun()
+
+        if submit_btn:
+            if not blogger_url.strip():
+                st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation" style="font-size: 20px;"></i> Укажите ссылку на блогера.</div>""", unsafe_allow_html=True)
+            else:
+                apify_debug_raw = None
+                apify_debug_error = None
+                raw_df = None
+
+                if active_data_source_mode == "manual":
+                    st.session_state.reels_data = edited_df
+                    raw_df = edited_df
+                else:
+                    if not st.session_state.cfg_apify_token:
+                        st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation"></i> Не задан Apify API-токен — впишите его в панели администратора.</div>""", unsafe_allow_html=True)
+                    else:
+                        username = extract_instagram_username(blogger_url)
+                        with st.spinner(f"Собираю ролики @{username} через Apify..."):
+                            try:
+                                items = fetch_reels_via_apify(
+                                    st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
+                                    targets=[username], results_limit=st.session_state.cfg_results_limit,
+                                    lookback_days=st.session_state.cfg_lookback_days, include_transcript=False,
+                                )
+                                apify_debug_raw = items[0] if items else "(пустой список)"
+                                raw_df = apify_items_to_dataframe(items)
+                            except Exception as exc:
+                                apify_debug_error = f"{type(exc).__name__}: {exc}"
+
+                if apify_debug_raw is not None or apify_debug_error is not None:
+                    with st.expander("🔍 Сырой ответ Apify (для отладки)"):
+                        if apify_debug_error: st.code(apify_debug_error, language="text")
+                        if apify_debug_raw is not None: st.code(json.dumps(apify_debug_raw, ensure_ascii=False, indent=2) if not isinstance(apify_debug_raw, str) else apify_debug_raw, language="json")
+
+                if raw_df is not None and not apify_debug_error:
+                    metrics_df, median_views = compute_reels_metrics(raw_df, active_viral_threshold)
+                    valid_count = len(metrics_df)
+
+                    if valid_count == 0:
+                        st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation"></i> Не найдено ни одного ролика.</div>""", unsafe_allow_html=True)
+                    else:
+                        if valid_count < active_min_reels:
+                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Роликов в выборке: {valid_count} (рекомендовано минимум {active_min_reels}).</div>""", unsafe_allow_html=True)
+
+                        top_viral_df, threshold_met = select_top_viral(metrics_df, active_viral_threshold, active_top_n_viral)
+                        if not threshold_met:
+                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Ни один ролик не превысил порог {active_viral_threshold}x медианы.</div>""", unsafe_allow_html=True)
+
+                        if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript and st.session_state.cfg_apify_token and not top_viral_df.empty):
+                            top_links = [l for l in top_viral_df["Ссылка на ролик"].tolist() if l]
+                            if top_links:
+                                with st.spinner(f"Транскрибирую топ-{len(top_links)} залётных ролика..."):
+                                    try:
+                                        transcript_items = fetch_reels_via_apify(
+                                            st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
+                                            targets=top_links, results_limit=None, lookback_days=None,
+                                            include_transcript=True, timeout=420,
+                                        )
+                                        transcript_df = apify_items_to_dataframe(transcript_items)
+                                        transcript_map = dict(zip(transcript_df["Ссылка на ролик"], transcript_df["Транскрипция (если есть)"]))
+                                        top_viral_df = top_viral_df.copy()
+                                        top_viral_df["Транскрипция (если есть)"] = top_viral_df["Ссылка на ролик"].map(
+                                            lambda u: transcript_map.get(u) or top_viral_df.loc[top_viral_df["Ссылка на ролик"] == u, "Транскрипция (если есть)"].values[0]
+                                        )
+                                    except Exception as exc:
+                                        st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию ({type(exc).__name__}: {exc}). Анализ пойдёт без текста речи.</div>""", unsafe_allow_html=True)
+
+                        st.markdown("<hr style='margin: 24px 0; border-color: rgba(255,255,255,0.1);'>", unsafe_allow_html=True)
+                        st.markdown("### 1️⃣ Метрики роликов", unsafe_allow_html=True)
+                        st.dataframe(metrics_df[["Ссылка на ролик", "Просмотры", "ER_%", "Индекс_к_медиане", "Аномалия"]], use_container_width=True, hide_index=True)
+                        st.markdown(f"**Топ-{len(top_viral_df)} для глубокого разбора:**")
+                        st.dataframe(top_viral_df[["Ссылка на ролик", "Просмотры", "Индекс_к_медиане"]], use_container_width=True, hide_index=True)
+
+                        st.markdown("### 2️⃣ Разбор от ИИ и сценарии", unsafe_allow_html=True)
+                        debug_raw_text = None
+                        debug_error_detail = None
+                        with st.spinner("ИИ анализирует ролики и пишет сценарии..."):
+                            result = None
+                            if not st.session_state.cfg_ai_key:
+                                result = fallback_result("не задан API-ключ")
+                            elif active_provider_mode == "anthropic_direct" and Anthropic is None:
+                                result = fallback_result("не установлена библиотека anthropic")
+                            elif active_provider_mode == "openrouter" and OpenAI is None:
+                                result = fallback_result("не установлена библиотека openai")
+                            else:
+                                try:
+                                    user_prompt = build_user_prompt(blogger_url, product_brief, metrics_df, median_views, active_scenarios_count, top_viral_df)
+                                    if active_provider_mode == "anthropic_direct":
+                                        client = Anthropic(api_key=st.session_state.cfg_ai_key)
+                                        response = client.messages.create(model=active_model, max_tokens=active_max_tokens, system=active_system_prompt, messages=[{"role": "user", "content": user_prompt}])
+                                        raw_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+                                    else:
+                                        client = OpenAI(base_url=active_base_url, api_key=st.session_state.cfg_ai_key)
+                                        response = call_chat_completion(client, active_model, messages=[{"role": "system", "content": active_system_prompt}, {"role": "user", "content": user_prompt}], max_tokens=active_max_tokens, provider_mode=active_provider_mode)
+                                        raw_text = response.choices[0].message.content or ""
+                                    debug_raw_text = raw_text
+                                    if not raw_text.strip(): raise ValueError("EMPTY_MODEL_RESPONSE")
+                                    result = json.loads(strip_json_fences(raw_text))
+                                except ValueError as exc:
+                                    result = fallback_result("лимит модели или пустой ответ") if str(exc) == "EMPTY_MODEL_RESPONSE" else fallback_result(f"ошибка: {exc}")
+                                except json.JSONDecodeError:
+                                    result = fallback_result("не удалось разобрать ответ модели как JSON")
+                                except Exception as exc:
+                                    debug_error_detail = f"{type(exc).__name__}: {exc}"
+                                    result = fallback_result(f"ошибка обращения к API: {exc}")
+
+                        if debug_raw_text is not None or debug_error_detail is not None:
+                            with st.expander("🔍 Сырой ответ модели / детали ошибки (для отладки)"):
+                                if debug_error_detail: st.code(debug_error_detail, language="text")
+                                if debug_raw_text is not None: st.code(debug_raw_text if debug_raw_text else "(модель вернула пустую строку)", language="text")
+
+                        st.markdown(f"""<div class="ai-report-glass fade-in-container"><b>Общая картина по аудитории:</b><br>{html.escape(result.get("audience_summary", ""))}</div>""", unsafe_allow_html=True)
+                        st.markdown("#### Найденные паттерны", unsafe_allow_html=True)
+                        patt_cols = st.columns(min(3, max(1, len(result.get("patterns", [])))) or 1)
+                        for i, patt in enumerate(result.get("patterns", [])):
+                            strength = patt.get("strength", "предварительная")
+                            badge_class = {"высокая": "badge-high", "средняя": "badge-medium"}.get(strength, "badge-low")
+                            with patt_cols[i % len(patt_cols)]:
+                                st.markdown(f"""
+                                    <div class="glass-metric fade-in-container" style="margin-bottom: 14px;">
+                                        <div class="metric-title">Паттерн</div>
+                                        <div class="metric-value" style="font-size: 16px;">{html.escape(patt.get("pattern", ""))}</div>
+                                        <div class="metric-delta" style="color:#94a3b8;">{html.escape(patt.get("evidence", ""))}</div>
+                                        <span class="pattern-badge {badge_class}">{html.escape(strength)}</span>
+                                    </div>
+                                """, unsafe_allow_html=True)
+
+                        st.markdown("#### Сценарии роликов под товар", unsafe_allow_html=True)
+                        for scenario in result.get("scenarios", []):
+                            fit = scenario.get("fit_score", "средний")
+                            fit_class = {"высокий": "fit-high", "средний": "fit-medium"}.get(fit, "fit-low")
+                            st.markdown(f"""
+                                <div class="ai-report-glass fade-in-container">
+                                    <h4 style="margin-top:0;">🎬 {html.escape(scenario.get("title", ""))} <span class="{fit_class}" style="float:right; font-size: 14px;">Fit: {html.escape(fit)}</span></h4>
+                                    <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {html.escape(scenario.get("based_on_pattern", "—"))}</p>
+                                    <hr style="border-color: rgba(255,255,255,0.1);">
+                                    <p><b>Хук:</b> {html.escape(scenario.get("hook", ""))}</p>
+                                    <p><b>Сценарий:</b><br>{str(html.escape(scenario.get("script", ""))).replace(chr(10), "<br>")}</p>
+                                    <p><b>Подпись к посту:</b> {html.escape(scenario.get("caption", ""))}</p>
+                                </div>
+                            """, unsafe_allow_html=True)
+
+                        if result.get("verdict_note"):
+                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-circle-info" style="font-size: 18px;"></i> {html.escape(result.get("verdict_note"))}</div>""", unsafe_allow_html=True)
+
+                        if result.get("scenarios") and not str(result.get("audience_summary", "")).startswith("Не удалось"):
+                            saved_id = save_analysis(
+                                manager=selected_manager, blogger_url=blogger_url, blogger_handle=extract_instagram_username(blogger_url),
+                                data_source=active_data_source_mode, model_used=active_model, reels_count=valid_count,
+                                median_views=median_views, viral_count=len(top_viral_df) if threshold_met else 0,
+                                product_brief=product_brief, metrics_df=metrics_df, top_viral_df=top_viral_df, result=result,
+                            )
+                            if saved_id: st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
+                            else: st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
+                        else:
+                            st.caption("Результат не сохранён в историю: ИИ не вернул готовых сценариев.")
