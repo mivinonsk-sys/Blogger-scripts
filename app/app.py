@@ -73,18 +73,29 @@ st.markdown(f"""
     </head>
 
     <style>
-    header[data-testid="stHeader"] {{ display: none !important; }}
+    /* --- Адаптация под телефоны и ПК --- */
+    @media (min-width: 992px) {{
+        header[data-testid="stHeader"] {{ display: none !important; }}
+        [data-testid="stSidebarCollapseButton"],
+        [data-testid="stSidebarCollapsedControl"],
+        [data-testid="collapsedControl"] {{ display: none !important; }}
+        section[data-testid="stSidebar"] {{
+            transform: none !important;
+            visibility: visible !important;
+            min-width: 300px !important;
+        }}
+    }}
 
-    [data-testid="stSidebarCollapseButton"],
-    [data-testid="stSidebarCollapsedControl"],
-    [data-testid="collapsedControl"] {{
-        display: none !important;
+    @media (max-width: 991px) {{
+        header[data-testid="stHeader"] {{ background: transparent !important; }}
+        .global-theme-switcher {{ 
+            right: 60px !important; /* отодвигаем от стандартного "гамбургера" меню */
+            transform: scale(0.85); 
+            transform-origin: right top; 
+        }}
+        .stMainBlockContainer {{ padding-top: 4rem !important; padding-left: 1rem !important; padding-right: 1rem !important; }}
     }}
-    section[data-testid="stSidebar"] {{
-        transform: none !important;
-        visibility: visible !important;
-        min-width: 300px !important;
-    }}
+
     html, body, [class*="css"] {{ font-family: 'Plus Jakarta Sans', sans-serif !important; }}
 
     .global-theme-switcher {{
@@ -269,6 +280,18 @@ st.markdown(f"""
         background: rgba(220,38,38,0.06) !important; border-color: rgba(220,38,38,0.3) !important;
         color: #dc2626 !important;
     }}
+    [data-testid="stWarning"], [data-testid="stError"] {{ display: none !important; }}
+
+    .fit-high {{ color: #10b981; font-weight: 800; }}
+    .fit-medium {{ color: #f59e0b; font-weight: 800; }}
+    .fit-low {{ color: #ef4444; font-weight: 800; }}
+    .pattern-badge {{
+        display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700;
+        margin-right: 6px; margin-bottom: 6px;
+    }}
+    .badge-high {{ background: rgba(16,185,129,0.18); color: #10b981; border: 1px solid rgba(16,185,129,0.4); }}
+    .badge-medium {{ background: rgba(245,158,11,0.18); color: #f59e0b; border: 1px solid rgba(245,158,11,0.4); }}
+    .badge-low {{ background: rgba(239,68,68,0.18); color: #ef4444; border: 1px solid rgba(239,68,68,0.4); }}
 
     .fade-in-container {{ animation: smoothAppearScale 0.7s cubic-bezier(0.16, 1, 0.3, 1) forwards; }}
 
@@ -362,28 +385,6 @@ st.markdown(f"""
     .theme-night .empty-state {{ background: rgba(15,23,42,0.4); color: #94a3b8; }}
     @keyframes smoothAppearScale {{ from {{opacity:0; transform: translateY(15px) scale(0.92);}} to {{opacity:1; transform: translateY(0) scale(1);}} }}
 
-    .custom-warning {{
-        padding: 18px 24px; border-radius: 14px; background: rgba(14,165,233,0.12); backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(14,165,233,0.4); display: flex;
-        align-items: center; gap: 12px; margin-bottom: 20px; font-weight: 600;
-    }}
-    .custom-error {{
-        padding: 18px 24px; border-radius: 14px; background: rgba(239,68,68,0.12); backdrop-filter: blur(14px);
-        -webkit-backdrop-filter: blur(14px); border: 1px solid rgba(239,68,68,0.5); display: flex;
-        align-items: center; gap: 12px; margin-bottom: 24px; font-weight: 600; color: #f87171;
-    }}
-    [data-testid="stWarning"], [data-testid="stError"] {{ display: none !important; }}
-
-    .fit-high {{ color: #10b981; font-weight: 800; }}
-    .fit-medium {{ color: #f59e0b; font-weight: 800; }}
-    .fit-low {{ color: #ef4444; font-weight: 800; }}
-    .pattern-badge {{
-        display: inline-block; padding: 4px 12px; border-radius: 20px; font-size: 12px; font-weight: 700;
-        margin-right: 6px; margin-bottom: 6px;
-    }}
-    .badge-high {{ background: rgba(16,185,129,0.18); color: #10b981; border: 1px solid rgba(16,185,129,0.4); }}
-    .badge-medium {{ background: rgba(245,158,11,0.18); color: #f59e0b; border: 1px solid rgba(245,158,11,0.4); }}
-    .badge-low {{ background: rgba(239,68,68,0.18); color: #ef4444; border: 1px solid rgba(239,68,68,0.4); }}
     </style>
 """, unsafe_allow_html=True)
 
