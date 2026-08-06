@@ -3,5 +3,3 @@ openai
 anthropic
 pandas
 httpx
-psycopg2-binary
-starlette<1.4.0
