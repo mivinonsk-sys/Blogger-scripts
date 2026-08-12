@@ -929,7 +929,7 @@ def select_top_viral(metrics_df: pd.DataFrame, threshold: float, top_n: int):
         return metrics_df.sort_values("Просмотры", ascending=False).head(top_n), False
     return qualifying.head(top_n), True
 
-def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df=None):
+def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df=None, previous_scenarios=None):
     table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
     viral_block = ""
     if top_viral_df is not None and not top_viral_df.empty:
@@ -939,10 +939,22 @@ def build_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_sc
             f"(здесь есть поле 'Транскрипция (если есть)' — используй именно его для разбора хука и структуры):\n"
             f"{json.dumps(viral_records, ensure_ascii=False, indent=2)}"
         )
+    regen_block = ""
+    if previous_scenarios:
+        prev_lines = "\n".join(
+            f"- «{s.get('title', '')}» — хук: {s.get('hook', '')}" for s in previous_scenarios
+        )
+        regen_block = (
+            "\n\nЭТО ПОВТОРНЫЙ ЗАПРОС «ОБНОВИТЬ СЦЕНАРИИ» (без повторного сбора и транскрибации роликов — "
+            "данные о роликах блогера те же). Напиши НОВЫЙ набор сценариев на основе тех же данных: "
+            "другие хуки, другие ракурсы подачи, по возможности другие anchor-ролики из ретроспективы, если "
+            "подходящих несколько. Не повторяй дословно прежние формулировки хуков и сценариев.\n"
+            f"Прежние сценарии (их НЕ повторять):\n{prev_lines}"
+        )
     return (
         f"Блогер: {blogger_url}\nМедиана просмотров: {median_views:.0f}\nНужно сценариев: {n_scenarios}\n\n"
         f"Бриф о товаре:\n{product_brief}\n\nВсе загруженные ролики:\n"
-        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}"
+        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{regen_block}"
     )
 
 def fallback_result(reason: str):
@@ -952,6 +964,104 @@ def fallback_result(reason: str):
         "scenarios": [{"title": "Демо-сценарий", "based_on_pattern": "—", "hook": "Настройте API-ключ OpenRouter", "script": "—", "caption": "—", "ad_marking_note": "Реклама.", "fit_score": "средний"}],
         "verdict_note": "Заполните ключ ИИ-помощника в настройках.",
     }
+
+
+def run_ai_analysis(blogger_url, product_brief, metrics_df, median_views, scenarios_count, top_viral_df,
+                     provider_mode, base_url, model, max_tokens, system_prompt, api_key, previous_result=None):
+    """
+    Единая точка вызова ИИ для получения audience_summary/patterns/scenarios.
+    Используется и при первом анализе, и при нажатии «🔄 Обновить сценарии»
+    (в последнем случае previous_result передаётся, чтобы ИИ написал НОВЫЙ набор
+    сценариев по уже собранным и уже транскрибированным роликам — без повторного
+    похода в Apify и без повторной транскрибации).
+    Возвращает (result_dict, raw_text_or_None, error_detail_or_None).
+    """
+    if not api_key:
+        return fallback_result("не задан API-ключ"), None, None
+    if provider_mode == "anthropic_direct" and Anthropic is None:
+        return fallback_result("не установлена библиотека anthropic"), None, None
+    if provider_mode != "anthropic_direct" and OpenAI is None:
+        return fallback_result("не установлена библиотека openai"), None, None
+
+    raw_text = None
+    previous_scenarios = (previous_result or {}).get("scenarios") if previous_result else None
+    try:
+        user_prompt = build_user_prompt(
+            blogger_url, product_brief, metrics_df, median_views, scenarios_count, top_viral_df,
+            previous_scenarios=previous_scenarios,
+        )
+        if provider_mode == "anthropic_direct":
+            client = Anthropic(api_key=api_key)
+            response = client.messages.create(
+                model=model, max_tokens=max_tokens, system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
+        else:
+            client = OpenAI(base_url=base_url, api_key=api_key)
+            response = call_chat_completion(
+                client, model,
+                messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
+                max_tokens=max_tokens, provider_mode=provider_mode,
+            )
+            raw_text = response.choices[0].message.content or ""
+        if not raw_text.strip():
+            raise ValueError("EMPTY_MODEL_RESPONSE")
+        result = json.loads(strip_json_fences(raw_text))
+        return result, raw_text, None
+    except ValueError as exc:
+        reason = "лимит модели или пустой ответ" if str(exc) == "EMPTY_MODEL_RESPONSE" else f"ошибка: {exc}"
+        return fallback_result(reason), raw_text, None
+    except json.JSONDecodeError:
+        return fallback_result("не удалось разобрать ответ модели как JSON"), raw_text, None
+    except Exception as exc:
+        detail = f"{type(exc).__name__}: {exc}"
+        return fallback_result(f"ошибка обращения к API: {exc}"), raw_text, detail
+
+
+def render_full_result(metrics_df, top_viral_df, result):
+    """Рендерит метрики + разбор ИИ + сценарии. Общая для первого анализа и после «Обновить сценарии»."""
+    st.markdown("<hr style='margin: 24px 0; border-color: rgba(255,255,255,0.1);'>", unsafe_allow_html=True)
+    st.markdown("### 1️⃣ Метрики роликов", unsafe_allow_html=True)
+    st.dataframe(metrics_df[["Ссылка на ролик", "Просмотры", "ER_%", "Индекс_к_медиане", "Аномалия"]], use_container_width=True, hide_index=True)
+    st.markdown(f"**Топ-{len(top_viral_df)} для глубокого разбора:**")
+    st.dataframe(top_viral_df[["Ссылка на ролик", "Просмотры", "Индекс_к_медиане"]], use_container_width=True, hide_index=True)
+
+    st.markdown("### 2️⃣ Разбор от ИИ и сценарии", unsafe_allow_html=True)
+    st.markdown(f"""<div class="ai-report-glass fade-in-container"><b>Общая картина по аудитории:</b><br>{html.escape(result.get("audience_summary", ""))}</div>""", unsafe_allow_html=True)
+    st.markdown("#### Найденные паттерны", unsafe_allow_html=True)
+    patterns = result.get("patterns", [])
+    patt_cols = st.columns(min(3, max(1, len(patterns))) or 1)
+    for i, patt in enumerate(patterns):
+        strength = patt.get("strength", "предварительная")
+        badge_class = {"высокая": "badge-high", "средняя": "badge-medium"}.get(strength, "badge-low")
+        with patt_cols[i % len(patt_cols)]:
+            st.markdown(f"""
+                <div class="glass-metric fade-in-container" style="margin-bottom: 14px;">
+                    <div class="metric-title">Паттерн</div>
+                    <div class="metric-value" style="font-size: 16px;">{html.escape(patt.get("pattern", ""))}</div>
+                    <div class="metric-delta" style="color:#94a3b8;">{html.escape(patt.get("evidence", ""))}</div>
+                    <span class="pattern-badge {badge_class}">{html.escape(strength)}</span>
+                </div>
+            """, unsafe_allow_html=True)
+
+    st.markdown("#### Сценарии роликов под товар", unsafe_allow_html=True)
+    for scenario in result.get("scenarios", []):
+        fit = scenario.get("fit_score", "средний")
+        fit_class = {"высокий": "fit-high", "средний": "fit-medium"}.get(fit, "fit-low")
+        st.markdown(f"""
+            <div class="ai-report-glass fade-in-container">
+                <h4 style="margin-top:0;">🎬 {html.escape(scenario.get("title", ""))} <span class="{fit_class}" style="float:right; font-size: 14px;">Fit: {html.escape(fit)}</span></h4>
+                <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {html.escape(scenario.get("based_on_pattern", "—"))}</p>
+                <hr style="border-color: rgba(255,255,255,0.1);">
+                <p><b>Хук:</b> {html.escape(scenario.get("hook", ""))}</p>
+                <p><b>Сценарий:</b><br>{str(html.escape(scenario.get("script", ""))).replace(chr(10), "<br>")}</p>
+                <p><b>Подпись к посту:</b> {html.escape(scenario.get("caption", ""))}</p>
+            </div>
+        """, unsafe_allow_html=True)
+
+    if result.get("verdict_note"):
+        st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-circle-info" style="font-size: 18px;"></i> {html.escape(result.get("verdict_note"))}</div>""", unsafe_allow_html=True)
 
 
 # ============================================================================
@@ -1246,6 +1356,27 @@ def get_analyses(manager=None, limit=500):
             return [dict(r) for r in rows]
     except Exception:
         return []
+
+def update_analysis_result(analysis_id, result, viral_count=None):
+    """Обновляет result_json (и при необходимости viral_count) у уже сохранённой записи —
+    используется кнопкой «🔄 Обновить сценарии», чтобы не плодить дубликаты в истории."""
+    if not analysis_id:
+        return False
+    try:
+        with db_connect() as conn:
+            if viral_count is not None:
+                conn.execute(
+                    "UPDATE analyses SET result_json = ?, viral_count = ? WHERE id = ?",
+                    (json.dumps(result, ensure_ascii=False), int(viral_count), analysis_id),
+                )
+            else:
+                conn.execute(
+                    "UPDATE analyses SET result_json = ? WHERE id = ?",
+                    (json.dumps(result, ensure_ascii=False), analysis_id),
+                )
+        return True
+    except Exception:
+        return False
 
 def get_manager_stats():
     try:
@@ -1844,95 +1975,35 @@ else:
                                     except Exception as exc:
                                         st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию ({type(exc).__name__}: {exc}). Анализ пойдёт без текста речи.</div>""", unsafe_allow_html=True)
 
-                        st.markdown("<hr style='margin: 24px 0; border-color: rgba(255,255,255,0.1);'>", unsafe_allow_html=True)
-                        st.markdown("### 1️⃣ Метрики роликов", unsafe_allow_html=True)
-                        st.dataframe(metrics_df[["Ссылка на ролик", "Просмотры", "ER_%", "Индекс_к_медиане", "Аномалия"]], use_container_width=True, hide_index=True)
-                        st.markdown(f"**Топ-{len(top_viral_df)} для глубокого разбора:**")
-                        st.dataframe(top_viral_df[["Ссылка на ролик", "Просмотры", "Индекс_к_медиане"]], use_container_width=True, hide_index=True)
-
-                        st.markdown("### 2️⃣ Разбор от ИИ и сценарии", unsafe_allow_html=True)
                         debug_raw_text = None
                         debug_error_detail = None
                         with st.spinner("ИИ анализирует ролики и пишет сценарии..."):
-                            result = None
-                            if not st.session_state.cfg_ai_key:
-                                result = fallback_result("не задан API-ключ")
-                            elif active_provider_mode == "anthropic_direct" and Anthropic is None:
-                                result = fallback_result("не установлена библиотека anthropic")
-                            elif active_provider_mode == "openrouter" and OpenAI is None:
-                                result = fallback_result("не установлена библиотека openai")
-                            else:
-                                try:
-                                    user_prompt = build_user_prompt(blogger_url, product_brief, metrics_df, median_views, active_scenarios_count, top_viral_df)
-                                    if active_provider_mode == "anthropic_direct":
-                                        client = Anthropic(api_key=st.session_state.cfg_ai_key)
-                                        response = client.messages.create(model=active_model, max_tokens=active_max_tokens, system=active_system_prompt, messages=[{"role": "user", "content": user_prompt}])
-                                        raw_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
-                                    else:
-                                        client = OpenAI(base_url=active_base_url, api_key=st.session_state.cfg_ai_key)
-                                        response = call_chat_completion(client, active_model, messages=[{"role": "system", "content": active_system_prompt}, {"role": "user", "content": user_prompt}], max_tokens=active_max_tokens, provider_mode=active_provider_mode)
-                                        raw_text = response.choices[0].message.content or ""
-                                    debug_raw_text = raw_text
-                                    if not raw_text.strip(): raise ValueError("EMPTY_MODEL_RESPONSE")
-                                    result = json.loads(strip_json_fences(raw_text))
-                                except ValueError as exc:
-                                    result = fallback_result("лимит модели или пустой ответ") if str(exc) == "EMPTY_MODEL_RESPONSE" else fallback_result(f"ошибка: {exc}")
-                                except json.JSONDecodeError:
-                                    result = fallback_result("не удалось разобрать ответ модели как JSON")
-                                except Exception as exc:
-                                    debug_error_detail = f"{type(exc).__name__}: {exc}"
-                                    result = fallback_result(f"ошибка обращения к API: {exc}")
+                            result, debug_raw_text, debug_error_detail = run_ai_analysis(
+                                blogger_url, product_brief, metrics_df, median_views, active_scenarios_count,
+                                top_viral_df, active_provider_mode, active_base_url, active_model,
+                                active_max_tokens, active_system_prompt, st.session_state.cfg_ai_key,
+                            )
 
                         if debug_raw_text is not None or debug_error_detail is not None:
                             with st.expander("🔍 Сырой ответ модели / детали ошибки (для отладки)"):
                                 if debug_error_detail: st.code(debug_error_detail, language="text")
                                 if debug_raw_text is not None: st.code(debug_raw_text if debug_raw_text else "(модель вернула пустую строку)", language="text")
 
-                        st.markdown(f"""<div class="ai-report-glass fade-in-container"><b>Общая картина по аудитории:</b><br>{html.escape(result.get("audience_summary", ""))}</div>""", unsafe_allow_html=True)
-                        st.markdown("#### Найденные паттерны", unsafe_allow_html=True)
-                        patt_cols = st.columns(min(3, max(1, len(result.get("patterns", [])))) or 1)
-                        for i, patt in enumerate(result.get("patterns", [])):
-                            strength = patt.get("strength", "предварительная")
-                            badge_class = {"высокая": "badge-high", "средняя": "badge-medium"}.get(strength, "badge-low")
-                            with patt_cols[i % len(patt_cols)]:
-                                st.markdown(f"""
-                                    <div class="glass-metric fade-in-container" style="margin-bottom: 14px;">
-                                        <div class="metric-title">Паттерн</div>
-                                        <div class="metric-value" style="font-size: 16px;">{html.escape(patt.get("pattern", ""))}</div>
-                                        <div class="metric-delta" style="color:#94a3b8;">{html.escape(patt.get("evidence", ""))}</div>
-                                        <span class="pattern-badge {badge_class}">{html.escape(strength)}</span>
-                                    </div>
-                                """, unsafe_allow_html=True)
-
-                        st.markdown("#### Сценарии роликов под товар", unsafe_allow_html=True)
-                        for scenario in result.get("scenarios", []):
-                            fit = scenario.get("fit_score", "средний")
-                            fit_class = {"высокий": "fit-high", "средний": "fit-medium"}.get(fit, "fit-low")
-                            st.markdown(f"""
-                                <div class="ai-report-glass fade-in-container">
-                                    <h4 style="margin-top:0;">🎬 {html.escape(scenario.get("title", ""))} <span class="{fit_class}" style="float:right; font-size: 14px;">Fit: {html.escape(fit)}</span></h4>
-                                    <p style="color:#94a3b8; font-size: 13px;">На основе паттерна: {html.escape(scenario.get("based_on_pattern", "—"))}</p>
-                                    <hr style="border-color: rgba(255,255,255,0.1);">
-                                    <p><b>Хук:</b> {html.escape(scenario.get("hook", ""))}</p>
-                                    <p><b>Сценарий:</b><br>{str(html.escape(scenario.get("script", ""))).replace(chr(10), "<br>")}</p>
-                                    <p><b>Подпись к посту:</b> {html.escape(scenario.get("caption", ""))}</p>
-                                </div>
-                            """, unsafe_allow_html=True)
-
-                        if result.get("verdict_note"):
-                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-circle-info" style="font-size: 18px;"></i> {html.escape(result.get("verdict_note"))}</div>""", unsafe_allow_html=True)
-
                         # Считаем сводную статистику по залётности для выгрузки и сохраняем последний
-                        # результат анализа в сессии, чтобы кнопка «Выгрузить» ниже могла им пользоваться
-                        # даже после перезапуска скрипта при клике на саму кнопку.
+                        # результат анализа в сессии (включая бриф и данные роликов), чтобы кнопки
+                        # «Обновить сценарии» и «Выгрузить» ниже могли им пользоваться даже после
+                        # перезапуска скрипта при клике на сами кнопки.
                         viral_stats = compute_viral_summary_stats(metrics_df, active_viral_threshold)
                         st.session_state["last_analysis"] = {
                             "blogger_url": blogger_url,
+                            "product_brief": product_brief,
                             "metrics_df": metrics_df,
+                            "median_views": median_views,
                             "top_viral_df": top_viral_df,
                             "result": result,
                             "viral_stats": viral_stats,
                             "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                            "saved_id": None,
                         }
 
                         if result.get("scenarios") and not str(result.get("audience_summary", "")).startswith("Не удалось"):
@@ -1942,27 +2013,65 @@ else:
                                 median_views=median_views, viral_count=len(top_viral_df) if threshold_met else 0,
                                 product_brief=product_brief, metrics_df=metrics_df, top_viral_df=top_viral_df, result=result,
                             )
-                            if saved_id: st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
+                            if saved_id:
+                                st.session_state["last_analysis"]["saved_id"] = saved_id
+                                st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
                             else: st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
                         else:
                             st.caption("Результат не сохранён в историю: ИИ не вернул готовых сценариев.")
 
-        # --- Кнопка выгрузки последнего сформированного анализа (появляется сразу после генерации
-        # сценариев и остаётся доступной, пока не будет запущен новый анализ) ---
+        # --- Единый блок отображения последнего анализа: рендер результата + кнопки
+        # «Обновить сценарии» (переписать без повторного сбора/транскрибации роликов) и «Выгрузить».
+        # Работает и сразу после генерации, и после клика «Обновить сценарии» (через session_state). ---
         if st.session_state.get("last_analysis"):
             la = st.session_state["last_analysis"]
+            render_full_result(la["metrics_df"], la["top_viral_df"], la["result"])
+
             st.markdown("<hr style='margin: 22px 0; opacity:0.2;'>", unsafe_allow_html=True)
-            exp_col1, exp_col2 = st.columns([3, 1])
-            with exp_col1:
+            info_col, refresh_col, export_col = st.columns([3, 1, 1])
+            with info_col:
                 st.markdown(
-                    f"📤 **Готово к выгрузке:** анализ @{extract_instagram_username(la['blogger_url'])} — "
-                    f"скопируйте таблицу и вставьте в Google Таблицы.",
+                    f"📤 **Готово к выгрузке:** анализ @{extract_instagram_username(la['blogger_url'])} "
+                    f"({la.get('created', '')}) — можно переписать сценарии или скопировать таблицу для Google Таблиц.",
                 )
-            with exp_col2:
-                if st.button("📤 Выгрузить", use_container_width=True, key="export_btn_persist", type="primary"):
-                    table_html, tsv_text = build_export_table(la["blogger_url"], la["viral_stats"], la["top_viral_df"], la["result"], all_reels_df=la["metrics_df"])
-                    open_export_dialog(table_html, tsv_text, {
-                        "handle": extract_instagram_username(la["blogger_url"]),
-                        "created": la.get("created", ""),
-                        "key": "persist",
-                    })
+            with refresh_col:
+                refresh_clicked = st.button("🔄 Обновить сценарии", use_container_width=True, key="refresh_scenarios_btn")
+            with export_col:
+                export_clicked = st.button("📤 Выгрузить", use_container_width=True, key="export_btn_persist", type="primary")
+
+            if refresh_clicked:
+                with st.spinner("ИИ переписывает сценарии — без повторного сбора и транскрибации роликов..."):
+                    new_result, refresh_raw_text, refresh_error_detail = run_ai_analysis(
+                        la["blogger_url"], la["product_brief"], la["metrics_df"], la["median_views"],
+                        active_scenarios_count, la["top_viral_df"],
+                        active_provider_mode, active_base_url, active_model, active_max_tokens,
+                        active_system_prompt, st.session_state.cfg_ai_key, previous_result=la["result"],
+                    )
+                if refresh_raw_text is not None or refresh_error_detail is not None:
+                    with st.expander("🔍 Сырой ответ модели / детали ошибки (обновление сценариев)"):
+                        if refresh_error_detail: st.code(refresh_error_detail, language="text")
+                        if refresh_raw_text is not None: st.code(refresh_raw_text if refresh_raw_text else "(модель вернула пустую строку)", language="text")
+
+                if new_result.get("scenarios") and not str(new_result.get("audience_summary", "")).startswith("Не удалось"):
+                    la["result"] = new_result
+                    la["created"] = datetime.now().strftime("%d.%m.%Y %H:%M")
+                    st.session_state["last_analysis"] = la
+                    if la.get("saved_id"):
+                        updated_ok = update_analysis_result(la["saved_id"], new_result)
+                        if updated_ok:
+                            st.success("✅ Сценарии обновлены — история анализа тоже обновлена.")
+                        else:
+                            st.warning("Сценарии обновлены, но не удалось обновить запись в истории.")
+                    else:
+                        st.success("✅ Сценарии обновлены.")
+                    st.rerun()
+                else:
+                    st.error("Не удалось получить новые сценарии от ИИ — прежний результат оставлен без изменений.")
+
+            if export_clicked:
+                table_html, tsv_text = build_export_table(la["blogger_url"], la["viral_stats"], la["top_viral_df"], la["result"], all_reels_df=la["metrics_df"])
+                open_export_dialog(table_html, tsv_text, {
+                    "handle": extract_instagram_username(la["blogger_url"]),
+                    "created": la.get("created", ""),
+                    "key": "persist",
+                })
