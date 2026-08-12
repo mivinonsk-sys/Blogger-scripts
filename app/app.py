@@ -954,6 +954,200 @@ def fallback_result(reason: str):
     }
 
 
+# ============================================================================
+# ЭКСПОРТ АНАЛИЗА В ФОРМАТ ДЛЯ ВСТАВКИ В GOOGLE ТАБЛИЦЫ
+# ============================================================================
+def compute_viral_summary_stats(metrics_df: pd.DataFrame, viral_threshold: float = None):
+    """
+    Считает: сколько всего роликов, сколько из них залётных, % залёта,
+    средний охват НЕ залётных и средний охват залётных роликов.
+    Если в metrics_df уже есть колонка 'Аномалия' (посчитанная при анализе) — используем её,
+    чтобы для сохранённой истории цифры совпадали с тем, что реально анализировалось.
+    """
+    if metrics_df is None or metrics_df.empty:
+        return {"total": 0, "viral_count": 0, "viral_pct": 0.0, "avg_non_viral_views": 0, "avg_viral_views": 0}
+
+    total = len(metrics_df)
+
+    if "Аномалия" in metrics_df.columns:
+        is_viral = metrics_df["Аномалия"].astype(bool)
+    elif "Индекс_к_медиане" in metrics_df.columns and viral_threshold:
+        is_viral = metrics_df["Индекс_к_медиане"].apply(lambda x: bool(x and x >= viral_threshold))
+    else:
+        is_viral = pd.Series([False] * total, index=metrics_df.index)
+
+    views_col = pd.to_numeric(metrics_df["Просмотры"], errors="coerce").fillna(0) if "Просмотры" in metrics_df.columns else pd.Series([0] * total)
+
+    viral_views = views_col[is_viral]
+    non_viral_views = views_col[~is_viral]
+
+    viral_count = int(is_viral.sum())
+    viral_pct = round(viral_count / total * 100, 1) if total else 0.0
+    avg_viral = int(round(viral_views.mean())) if len(viral_views) else 0
+    avg_non_viral = int(round(non_viral_views.mean())) if len(non_viral_views) else 0
+
+    return {
+        "total": total,
+        "viral_count": viral_count,
+        "viral_pct": viral_pct,
+        "avg_non_viral_views": avg_non_viral,
+        "avg_viral_views": avg_viral,
+    }
+
+
+def build_export_table(blogger_url, viral_stats, top_viral_df, result):
+    """
+    Собирает таблицу выгрузки (как HTML-таблица + TSV-запасной вариант) в формате,
+    близком к шаблону Google Таблицы: строка сводки по блогеру + строка деталей
+    (залётные ролики, аудитория, сценарии).
+    Цена и Охват по вышедшим РК оставляем пустыми — заполняются вручную по факту.
+    """
+    def fmt_num(n):
+        try:
+            return f"{int(round(float(n))):,}".replace(",", " ")
+        except Exception:
+            return str(n)
+
+    headers_main = [
+        "блогер", "Цена", "% залёта", "Средний Охват без залётов",
+        "Сред. Охват Залётных", "Охват по вышедшим РК",
+        "Общий анализ роликов", "Обобщённый ответ по блогеру",
+    ]
+    pct = viral_stats.get("viral_pct", 0) or 0
+    row_overview = [
+        blogger_url or "",
+        "",  # Цена — заполняется вручную
+        f"{pct:g}%",
+        fmt_num(viral_stats.get("avg_non_viral_views", 0)),
+        fmt_num(viral_stats.get("avg_viral_views", 0)),
+        "",  # Охват по вышедшим РК — заполняется вручную
+        "",  # Общий анализ роликов — можно вставить ссылку на полный разбор вручную
+        result.get("verdict_note", "") or "",
+    ]
+
+    scenarios = result.get("scenarios", []) or []
+    sub_headers = ["Залётные ролики ссылка/охват/ER", "Общая картина по аудитории"] + \
+                  [f"Сценарий {i + 1}" for i in range(len(scenarios))]
+
+    viral_lines = []
+    if top_viral_df is not None and not top_viral_df.empty:
+        for _, r in top_viral_df.iterrows():
+            link = r.get("Ссылка на ролик", "")
+            views = r.get("Просмотры", 0)
+            er = r.get("ER_%", "")
+            viral_lines.append(f"{link}  {fmt_num(views)}  ER {er}%")
+    viral_cell = "\n".join(viral_lines)
+
+    scenario_cells = []
+    for s in scenarios:
+        based_on = s.get("based_on_video") or s.get("based_on_pattern") or "—"
+        block = (
+            f"🎬 {s.get('title', '')}\n"
+            f"На основе: {based_on}\n\n"
+            f"Хук: {s.get('hook', '')}\n\n"
+            f"Сценарий: {s.get('script', '')}\n\n"
+            f"Подпись: {s.get('caption', '')}\n"
+            f"{s.get('ad_marking_note', '')}\n"
+            f"Fit: {s.get('fit_score', '')}"
+        )
+        scenario_cells.append(block)
+
+    row_details = [viral_cell, result.get("audience_summary", "") or ""] + scenario_cells
+
+    def esc(v):
+        return html.escape(str(v)).replace("\n", "<br>")
+
+    def html_row(cells, header=False):
+        cell_style = (
+            "background:#2e6f6b;color:#fff;font-weight:700;padding:8px 12px;"
+            "border:1px solid #9ec5c2;text-align:left;"
+            if header else
+            "padding:8px 12px;border:1px solid #cfd8dc;vertical-align:top;"
+            "white-space:pre-wrap;min-width:140px;max-width:320px;"
+        )
+        cells_html = "".join(f'<td style="{cell_style}">{esc(c)}</td>' for c in cells)
+        return f"<tr>{cells_html}</tr>"
+
+    table_html = (
+        "<table style='border-collapse:collapse;font-family:Arial,sans-serif;font-size:13px;width:100%;'>"
+        + html_row(headers_main, header=True)
+        + html_row(row_overview)
+        + html_row(sub_headers, header=True)
+        + html_row(row_details)
+        + "</table>"
+    )
+
+    def tsv_line(cells):
+        return "\t".join(str(c).replace("\t", " ").replace("\r", " ").replace("\n", " ⏎ ") for c in cells)
+
+    tsv_text = "\n".join([
+        tsv_line(headers_main),
+        tsv_line(row_overview),
+        tsv_line(sub_headers),
+        tsv_line(row_details),
+    ])
+
+    return table_html, tsv_text
+
+
+def render_copy_button(table_html: str, tsv_text: str, key: str):
+    """Кнопка «Копировать» — копирует таблицу в буфер обмена как HTML-таблицу
+    (чтобы Google Таблицы разложили её по столбцам и строкам при вставке),
+    с текстовым TSV-вариантом как запасным."""
+    html_js = json.dumps(table_html)
+    text_js = json.dumps(tsv_text)
+    components.html(f"""
+    <div style="display:flex; justify-content:flex-end; align-items:center; gap:10px; margin-bottom:10px; font-family:'Plus Jakarta Sans',sans-serif;">
+      <span id="copy-status-{key}" style="font-size:12px; color:#10b981; font-weight:600;"></span>
+      <button id="copy-btn-{key}" style="cursor:pointer; border:none; background:linear-gradient(135deg,#0a8ed9,#0670b0); color:#fff; padding:9px 16px; border-radius:10px; font-weight:700; font-size:13px; box-shadow:0 4px 12px rgba(10,142,217,0.3);">
+        📋 Копировать таблицу
+      </button>
+    </div>
+    <script>
+      const btn = document.getElementById("copy-btn-{key}");
+      const status = document.getElementById("copy-status-{key}");
+      btn.addEventListener("click", async () => {{
+        const htmlContent = {html_js};
+        const textContent = {text_js};
+        try {{
+          if (window.ClipboardItem) {{
+            const item = new ClipboardItem({{
+              "text/html": new Blob([htmlContent], {{type: "text/html"}}),
+              "text/plain": new Blob([textContent], {{type: "text/plain"}}),
+            }});
+            await navigator.clipboard.write([item]);
+          }} else {{
+            await navigator.clipboard.writeText(textContent);
+          }}
+          status.innerText = "✅ Скопировано — вставьте в Google Таблицы";
+        }} catch (err) {{
+          try {{
+            await navigator.clipboard.writeText(textContent);
+            status.innerText = "✅ Скопировано (текстом)";
+          }} catch (err2) {{
+            status.innerText = "⚠️ Не удалось скопировать: " + err2;
+          }}
+        }}
+      }});
+    </script>
+    """, height=55)
+
+
+@st.dialog("📤 Выгрузка анализа для Google Таблиц", width="large")
+def open_export_dialog(table_html, tsv_text, meta):
+    st.caption(f"@{meta.get('handle', '—')} · сформировано {meta.get('created', '')}")
+    render_copy_button(table_html, tsv_text, key=meta.get("key", "export"))
+    st.markdown(
+        f"<div style='overflow-x:auto; border-radius:12px; border:1px solid rgba(0,0,0,0.08);'>{table_html}</div>",
+        unsafe_allow_html=True,
+    )
+    st.caption(
+        "1) Нажмите «📋 Копировать таблицу» → 2) откройте нужную ячейку в Google Таблице → "
+        "3) вставьте (Ctrl+V / ⌘+V). Данные лягут по столбцам и строкам автоматически. "
+        "Цена и Охват по вышедшим РК — впишите вручную по факту."
+    )
+
+
 PIN_LENGTH = 4
 
 def render_pin_pad(form_key: str, title: str, subtitle: str):
@@ -1326,12 +1520,32 @@ else:
                 st.caption(f"Бриф товара на момент анализа: {record['product_brief'][:300]}")
             st.caption(f"Ссылка: {html.escape(record.get('blogger_url',''))}")
 
+            # --- Выгрузка сохранённого анализа в формате для Google Таблиц ---
+            try:
+                hist_metrics_df = pd.DataFrame(json.loads(record.get("metrics_json") or "[]"))
+            except Exception:
+                hist_metrics_df = pd.DataFrame()
+            try:
+                hist_top_viral_df = pd.DataFrame(json.loads(record.get("top_viral_json") or "[]"))
+            except Exception:
+                hist_top_viral_df = pd.DataFrame()
+            hist_viral_stats = compute_viral_summary_stats(hist_metrics_df)
+
+            exp_col, del_col = st.columns([1, 1])
+            with exp_col:
+                if st.button("📤 Выгрузить в Google Таблицы", key=f"export_{record['id']}", use_container_width=True):
+                    table_html, tsv_text = build_export_table(record.get("blogger_url", ""), hist_viral_stats, hist_top_viral_df, result)
+                    open_export_dialog(table_html, tsv_text, {
+                        "handle": handle, "created": created, "key": f"hist_{record['id']}",
+                    })
+
             if allow_delete:
-                if st.button("🗑 Удалить эту запись", key=f"del_{record['id']}"):
-                    if delete_analysis(record["id"]):
-                        st.success("Запись удалена — обновите вкладку.")
-                    else:
-                        st.error("Не удалось удалить запись.")
+                with del_col:
+                    if st.button("🗑 Удалить эту запись", key=f"del_{record['id']}", use_container_width=True):
+                        if delete_analysis(record["id"]):
+                            st.success("Запись удалена — обновите вкладку.")
+                        else:
+                            st.error("Не удалось удалить запись.")
 
     # --- ВКЛАДКИ ---
     if is_admin:
@@ -1696,6 +1910,19 @@ else:
                         if result.get("verdict_note"):
                             st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-circle-info" style="font-size: 18px;"></i> {html.escape(result.get("verdict_note"))}</div>""", unsafe_allow_html=True)
 
+                        # Считаем сводную статистику по залётности для выгрузки и сохраняем последний
+                        # результат анализа в сессии, чтобы кнопка «Выгрузить» ниже могла им пользоваться
+                        # даже после перезапуска скрипта при клике на саму кнопку.
+                        viral_stats = compute_viral_summary_stats(metrics_df, active_viral_threshold)
+                        st.session_state["last_analysis"] = {
+                            "blogger_url": blogger_url,
+                            "metrics_df": metrics_df,
+                            "top_viral_df": top_viral_df,
+                            "result": result,
+                            "viral_stats": viral_stats,
+                            "created": datetime.now().strftime("%d.%m.%Y %H:%M"),
+                        }
+
                         if result.get("scenarios") and not str(result.get("audience_summary", "")).startswith("Не удалось"):
                             saved_id = save_analysis(
                                 manager=selected_manager, blogger_url=blogger_url, blogger_handle=extract_instagram_username(blogger_url),
@@ -1707,3 +1934,23 @@ else:
                             else: st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
                         else:
                             st.caption("Результат не сохранён в историю: ИИ не вернул готовых сценариев.")
+
+        # --- Кнопка выгрузки последнего сформированного анализа (появляется сразу после генерации
+        # сценариев и остаётся доступной, пока не будет запущен новый анализ) ---
+        if st.session_state.get("last_analysis"):
+            la = st.session_state["last_analysis"]
+            st.markdown("<hr style='margin: 22px 0; opacity:0.2;'>", unsafe_allow_html=True)
+            exp_col1, exp_col2 = st.columns([3, 1])
+            with exp_col1:
+                st.markdown(
+                    f"📤 **Готово к выгрузке:** анализ @{extract_instagram_username(la['blogger_url'])} — "
+                    f"скопируйте таблицу и вставьте в Google Таблицы.",
+                )
+            with exp_col2:
+                if st.button("📤 Выгрузить", use_container_width=True, key="export_btn_persist", type="primary"):
+                    table_html, tsv_text = build_export_table(la["blogger_url"], la["viral_stats"], la["top_viral_df"], la["result"])
+                    open_export_dialog(table_html, tsv_text, {
+                        "handle": extract_instagram_username(la["blogger_url"]),
+                        "created": la.get("created", ""),
+                        "key": "persist",
+                    })
