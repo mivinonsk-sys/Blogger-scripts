@@ -995,11 +995,12 @@ def compute_viral_summary_stats(metrics_df: pd.DataFrame, viral_threshold: float
     }
 
 
-def build_export_table(blogger_url, viral_stats, top_viral_df, result):
+def build_export_table(blogger_url, viral_stats, top_viral_df, result, all_reels_df=None):
     """
     Собирает таблицу выгрузки (как HTML-таблица + TSV-запасной вариант) в формате,
     близком к шаблону Google Таблицы: строка сводки по блогеру + строка деталей
-    (залётные ролики, аудитория, сценарии).
+    (залётные ролики, аудитория, сценарии, и — правее последнего сценария —
+    полный список ВСЕХ выгруженных роликов, а не только залётных).
     Цена и Охват по вышедшим РК оставляем пустыми — заполняются вручную по факту.
     """
     def fmt_num(n):
@@ -1021,22 +1022,33 @@ def build_export_table(blogger_url, viral_stats, top_viral_df, result):
         fmt_num(viral_stats.get("avg_non_viral_views", 0)),
         fmt_num(viral_stats.get("avg_viral_views", 0)),
         "",  # Охват по вышедшим РК — заполняется вручную
-        "",  # Общий анализ роликов — можно вставить ссылку на полный разбор вручную
+        "",  # заголовок "Общий анализ роликов" — сами данные лежат в строке ниже, правее сценариев
         result.get("verdict_note", "") or "",
     ]
 
     scenarios = result.get("scenarios", []) or []
-    sub_headers = ["Залётные ролики ссылка/охват/ER", "Общая картина по аудитории"] + \
-                  [f"Сценарий {i + 1}" for i in range(len(scenarios))]
+    sub_headers = (
+        ["Залётные ролики ссылка/охват/ER", "Общая картина по аудитории"]
+        + [f"Сценарий {i + 1}" for i in range(len(scenarios))]
+        + ["Общий анализ роликов (все выгруженные ролики)"]
+    )
 
-    viral_lines = []
-    if top_viral_df is not None and not top_viral_df.empty:
-        for _, r in top_viral_df.iterrows():
-            link = r.get("Ссылка на ролик", "")
-            views = r.get("Просмотры", 0)
-            er = r.get("ER_%", "")
-            viral_lines.append(f"{link}  {fmt_num(views)}  ER {er}%")
-    viral_cell = "\n".join(viral_lines)
+    def reels_lines(df, mark_viral=False):
+        lines = []
+        if df is not None and not df.empty:
+            sort_df = df.sort_values("Просмотры", ascending=False) if "Просмотры" in df.columns else df
+            for _, r in sort_df.iterrows():
+                link = r.get("Ссылка на ролик", "")
+                views = r.get("Просмотры", 0)
+                er = r.get("ER_%", "")
+                prefix = "🔥 " if (mark_viral and bool(r.get("Аномалия", False))) else ""
+                lines.append(f"{prefix}{link}  {fmt_num(views)}  ER {er}%")
+        return lines
+
+    viral_cell = "\n".join(reels_lines(top_viral_df))
+    # Полный список ВСЕХ выгруженных сервисом роликов (не только топ залётных) —
+    # идёт в отдельную колонку правее последнего сценария.
+    all_reels_cell = "\n".join(reels_lines(all_reels_df, mark_viral=True))
 
     scenario_cells = []
     for s in scenarios:
@@ -1052,7 +1064,7 @@ def build_export_table(blogger_url, viral_stats, top_viral_df, result):
         )
         scenario_cells.append(block)
 
-    row_details = [viral_cell, result.get("audience_summary", "") or ""] + scenario_cells
+    row_details = [viral_cell, result.get("audience_summary", "") or ""] + scenario_cells + [all_reels_cell]
 
     def esc(v):
         return html.escape(str(v)).replace("\n", "<br>")
@@ -1534,7 +1546,7 @@ else:
             exp_col, del_col = st.columns([1, 1])
             with exp_col:
                 if st.button("📤 Выгрузить в Google Таблицы", key=f"export_{record['id']}", use_container_width=True):
-                    table_html, tsv_text = build_export_table(record.get("blogger_url", ""), hist_viral_stats, hist_top_viral_df, result)
+                    table_html, tsv_text = build_export_table(record.get("blogger_url", ""), hist_viral_stats, hist_top_viral_df, result, all_reels_df=hist_metrics_df)
                     open_export_dialog(table_html, tsv_text, {
                         "handle": handle, "created": created, "key": f"hist_{record['id']}",
                     })
@@ -1948,7 +1960,7 @@ else:
                 )
             with exp_col2:
                 if st.button("📤 Выгрузить", use_container_width=True, key="export_btn_persist", type="primary"):
-                    table_html, tsv_text = build_export_table(la["blogger_url"], la["viral_stats"], la["top_viral_df"], la["result"])
+                    table_html, tsv_text = build_export_table(la["blogger_url"], la["viral_stats"], la["top_viral_df"], la["result"], all_reels_df=la["metrics_df"])
                     open_export_dialog(table_html, tsv_text, {
                         "handle": extract_instagram_username(la["blogger_url"]),
                         "created": la.get("created", ""),
