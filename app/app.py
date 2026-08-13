@@ -800,6 +800,7 @@ if "settings_loaded" not in st.session_state:
     st.session_state.cfg_results_limit = load_setting_int("cfg_results_limit", 25)
     st.session_state.cfg_lookback_days = load_setting_int("cfg_lookback_days", 30)
     st.session_state.cfg_include_transcript = load_setting_bool("cfg_include_transcript", True)
+    st.session_state.cfg_transcript_freshness_days = load_setting_int("cfg_transcript_freshness_days", 5)
     
     st.session_state.cfg_viral_threshold = load_setting_float("cfg_viral_threshold", 2.5)
     st.session_state.cfg_top_n_viral = load_setting_int("cfg_top_n_viral", 3)
@@ -1821,6 +1822,53 @@ def update_analysis_result(analysis_id, result, viral_count=None):
     except Exception:
         return False
 
+def get_latest_analysis_for_blogger(blogger_handle):
+    """
+    Возвращает самую свежую сохранённую запись анализа для этого блогера — по ВСЕМ менеджерам
+    (транскрипция не зависит от того, кто именно запускал анализ, поэтому кэш общий на команду).
+    Используется, чтобы не гонять Apify-транскрибацию заново, если недавно уже транскрибировали
+    этого блогера.
+    """
+    if not blogger_handle:
+        return None
+    try:
+        with db_connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM analyses WHERE blogger_handle = ? ORDER BY created_at DESC LIMIT 1",
+                (blogger_handle,),
+            ).fetchone()
+            return dict(row) if row else None
+    except Exception:
+        return None
+
+def is_within_freshness_days(created_at_str, freshness_days) -> bool:
+    """True, если created_at_str (ISO-строка) не старше freshness_days дней от текущего момента."""
+    if not created_at_str:
+        return False
+    try:
+        created_dt = datetime.fromisoformat(created_at_str)
+        age_days = (datetime.now() - created_dt).total_seconds() / 86400
+        return age_days <= float(freshness_days)
+    except Exception:
+        return False
+
+def build_transcript_cache_from_record(record):
+    """{Ссылка на ролик: транскрипция} из top_viral_json сохранённой записи — только непустые
+    значения, чтобы не подставлять пустые строки поверх реальных данных."""
+    cache = {}
+    if not record:
+        return cache
+    try:
+        items = json.loads(record.get("top_viral_json") or "[]")
+    except Exception:
+        items = []
+    for it in items:
+        url = it.get("Ссылка на ролик", "")
+        transcript = it.get("Транскрипция (если есть)", "")
+        if url and transcript:
+            cache[url] = transcript
+    return cache
+
 def get_manager_stats():
     try:
         with db_connect() as conn:
@@ -1974,12 +2022,19 @@ else:
             results_limit_input = st.sidebar.number_input("Роликов с профиля за раз", min_value=5, max_value=100, value=st.session_state.cfg_results_limit, step=5)
             lookback_days_input = st.sidebar.number_input("Глубина в днях", min_value=7, max_value=90, value=st.session_state.cfg_lookback_days, step=1)
             include_transcript_input = st.sidebar.checkbox("Включить реальную транскрипцию", value=st.session_state.cfg_include_transcript)
+            transcript_freshness_days_input = st.sidebar.slider(
+                "Транскрипция актуальна, если моложе (дней)", 1, 30, st.session_state.cfg_transcript_freshness_days,
+                help="Если для этого блогера уже есть сохранённый анализ с транскрипцией не старше указанного "
+                     "числа дней — новая транскрибация через Apify не запускается, данные берутся из истории "
+                     "(экономит лимиты Apify). Если старше — транскрипция обновляется полностью.",
+            )
         else:
             apify_token_input = st.session_state.cfg_apify_token
             apify_actor_input = st.session_state.cfg_apify_actor
             results_limit_input = st.session_state.cfg_results_limit
             lookback_days_input = st.session_state.cfg_lookback_days
             include_transcript_input = st.session_state.cfg_include_transcript
+            transcript_freshness_days_input = st.session_state.cfg_transcript_freshness_days
 
         viral_threshold_input = st.sidebar.slider("Порог «залётности» (× медианы)", 1.5, 5.0, float(st.session_state.cfg_viral_threshold), 0.1)
         top_n_viral_input = st.sidebar.slider("Топ-N залётных роликов", 1, 6, st.session_state.cfg_top_n_viral)
@@ -2004,6 +2059,7 @@ else:
             st.session_state.cfg_results_limit = results_limit_input
             st.session_state.cfg_lookback_days = lookback_days_input
             st.session_state.cfg_include_transcript = include_transcript_input
+            st.session_state.cfg_transcript_freshness_days = transcript_freshness_days_input
             st.session_state.cfg_viral_threshold = viral_threshold_input
             st.session_state.cfg_top_n_viral = top_n_viral_input
             st.session_state.min_reels_required = min_reels_input
@@ -2022,6 +2078,7 @@ else:
             set_setting("cfg_results_limit", str(results_limit_input))
             set_setting("cfg_lookback_days", str(lookback_days_input))
             set_setting("cfg_include_transcript", str(include_transcript_input))
+            set_setting("cfg_transcript_freshness_days", str(transcript_freshness_days_input))
             set_setting("cfg_viral_threshold", str(viral_threshold_input))
             set_setting("cfg_top_n_viral", str(top_n_viral_input))
             set_setting("min_reels_required", str(min_reels_input))
@@ -2036,6 +2093,8 @@ else:
         st.sidebar.markdown(f"📥 **Источник данных:** {'Apify (авто)' if st.session_state.cfg_data_source_mode == 'apify' else 'Вручную'}")
         st.sidebar.markdown(f"📏 **Мин. роликов:** {st.session_state.min_reels_required}")
         st.sidebar.markdown(f"🧩 **Сценариев за раз:** {st.session_state.scenarios_count}")
+        if st.session_state.cfg_data_source_mode == "apify" and st.session_state.cfg_include_transcript:
+            st.sidebar.markdown(f"♻️ **Транскрипция актуальна:** {st.session_state.cfg_transcript_freshness_days} дн.")
 
     active_provider_mode = st.session_state.cfg_ai_provider_mode
     active_base_url = st.session_state.cfg_ai_base_url
@@ -2047,6 +2106,7 @@ else:
     active_data_source_mode = st.session_state.cfg_data_source_mode
     active_viral_threshold = st.session_state.cfg_viral_threshold
     active_top_n_viral = st.session_state.cfg_top_n_viral
+    active_transcript_freshness_days = st.session_state.cfg_transcript_freshness_days
 
     def extract_instagram_username(url_or_username: str) -> str:
         text = (url_or_username or "").strip()
@@ -2418,21 +2478,45 @@ else:
                         if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript and st.session_state.cfg_apify_token and not top_viral_df.empty):
                             top_links = [l for l in top_viral_df["Ссылка на ролик"].tolist() if l]
                             if top_links:
-                                with st.spinner(f"Транскрибирую топ-{len(top_links)} залётных ролика..."):
-                                    try:
-                                        transcript_items = fetch_reels_via_apify(
-                                            st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
-                                            targets=top_links, results_limit=None, lookback_days=None,
-                                            include_transcript=True, timeout=420,
-                                        )
-                                        transcript_df = apify_items_to_dataframe(transcript_items)
-                                        transcript_map = dict(zip(transcript_df["Ссылка на ролик"], transcript_df["Транскрипция (если есть)"]))
-                                        top_viral_df = top_viral_df.copy()
-                                        top_viral_df["Транскрипция (если есть)"] = top_viral_df["Ссылка на ролик"].map(
-                                            lambda u: transcript_map.get(u) or top_viral_df.loc[top_viral_df["Ссылка на ролик"] == u, "Транскрипция (если есть)"].values[0]
-                                        )
-                                    except Exception as exc:
-                                        st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию ({type(exc).__name__}: {exc}). Анализ пойдёт без текста речи.</div>""", unsafe_allow_html=True)
+                                # --- Сначала пробуем переиспользовать уже сохранённую транскрипцию этого
+                                # блогера (по всей команде), чтобы не жечь лимиты Apify без необходимости. ---
+                                blogger_handle_for_cache = extract_instagram_username(blogger_url)
+                                cached_record = get_latest_analysis_for_blogger(blogger_handle_for_cache)
+                                cache_is_fresh = bool(cached_record) and is_within_freshness_days(
+                                    cached_record.get("created_at", ""), active_transcript_freshness_days
+                                )
+                                transcript_cache = build_transcript_cache_from_record(cached_record) if cache_is_fresh else {}
+
+                                top_viral_df = top_viral_df.copy()
+                                if transcript_cache:
+                                    top_viral_df["Транскрипция (если есть)"] = top_viral_df["Ссылка на ролик"].map(
+                                        lambda u: transcript_cache.get(u) or top_viral_df.loc[top_viral_df["Ссылка на ролик"] == u, "Транскрипция (если есть)"].values[0]
+                                    )
+                                    cached_created = (cached_record.get("created_at") or "").replace("T", " ")[:16]
+                                    matched_count = sum(1 for l in top_links if l in transcript_cache)
+                                    st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-database"></i> Переиспользую сохранённую транскрипцию этого блогера от {cached_created} (не старше {active_transcript_freshness_days} дн.) — совпало {matched_count}/{len(top_links)} роликов, повторный запрос в Apify по ним не отправляется.</div>""", unsafe_allow_html=True)
+
+                                missing_links = [l for l in top_links if l not in transcript_cache]
+                                if missing_links:
+                                    spinner_text = (
+                                        f"Транскрибирую {len(missing_links)} новых ролика(ов), которых нет в сохранённой транскрипции..."
+                                        if transcript_cache else
+                                        f"Транскрибирую топ-{len(missing_links)} залётных ролика..."
+                                    )
+                                    with st.spinner(spinner_text):
+                                        try:
+                                            transcript_items = fetch_reels_via_apify(
+                                                st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
+                                                targets=missing_links, results_limit=None, lookback_days=None,
+                                                include_transcript=True, timeout=420,
+                                            )
+                                            transcript_df = apify_items_to_dataframe(transcript_items)
+                                            transcript_map = dict(zip(transcript_df["Ссылка на ролик"], transcript_df["Транскрипция (если есть)"]))
+                                            top_viral_df["Транскрипция (если есть)"] = top_viral_df["Ссылка на ролик"].map(
+                                                lambda u: transcript_map.get(u) or top_viral_df.loc[top_viral_df["Ссылка на ролик"] == u, "Транскрипция (если есть)"].values[0]
+                                            )
+                                        except Exception as exc:
+                                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию для {len(missing_links)} ролика(ов) ({type(exc).__name__}: {exc}). Эти ролики пойдут без текста речи.</div>""", unsafe_allow_html=True)
 
                         debug_raw_text = None
                         debug_error_detail = None
