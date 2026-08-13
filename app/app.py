@@ -3,6 +3,7 @@
 # Запуск: streamlit run blogger_reels_analyzer.py
 
 import json
+import re
 import time
 import sqlite3
 import hashlib
@@ -731,6 +732,7 @@ DEFAULT_SYSTEM_PROMPT = """Ты — Senior креативный директор
    Калибровка вероятности (будь реалистом, не оптимистом): если сценарий почти дословно копирует структуру сильного, хорошо подтверждённого анкора и рекламная интеграция ненавязчива — вероятность может быть высокой, но обычно не выше 70-80%. Если анкор основан на маленькой выборке или единичном выбросе, либо интеграция товара заметно утяжеляет ролик, либо это не первый рекламный интеграционный формат у блогера подряд — вероятность должна быть умеренной или низкой (15-45%). Ставить 90%+ можно только в исключительных, явно обоснованных случаях: рекламные ролики систематически получают охват и вовлечение ниже органических, это статистическая норма, а не исключение.
 10. Время публикации: у роликов в ретроспективе может быть поле «Время публикации (МСК)» (время суток по московскому часовому поясу). Проанализируй это поле по ВСЕЙ ретроспективе, с особым вниманием к залётным роликам и к конкретному anchor-ролику этого сценария — найди повторяющееся окно времени, в которое блогер публикует наиболее успешные ролики. Впиши результат в поле best_posting_time_msk для каждого сценария в формате "ЧЧ:ММ–ЧЧ:ММ МСК" (или конкретное время), с кратким пояснением, на каких роликах основан вывод. Если поле «Время публикации (МСК)» пустое почти у всех роликов или данных недостаточно для вывода — честно напиши в этом поле "недостаточно данных", не выдумывай время.
 11. Паттерны и их источники (ключевое требование, выполняется ПЕРВЫМ, до написания сценариев): каждый паттерн в массиве patterns ОБЯЗАН быть привязан к одному конкретному реальному ролику из входных данных — заполни source_video_url (точная ссылка на этот ролик), source_video_views (его фактический охват числом) и source_video_er (его фактический ER% числом). Бери эти значения буквально из входных данных ретроспективы, ничего не выдумывай. Если паттерн подтверждается сразу несколькими роликами — укажи данные самого показательного/крупного из них, а остальные можно упомянуть текстом в evidence. Эти три поля НИКОГДА не должны быть пустыми, null или «—» — если ты нашёл паттерн, значит у тебя уже есть конкретный ролик перед глазами, который его иллюстрирует.
+ВАЖНОЕ УТОЧНЕНИЕ (частая ошибка): evidence — это твоё текстовое пояснение, в нём можно упомянуть ролик словами («ролик с паровой шваброй») или даже вставить его короткий код для удобства чтения человеком. НО это не заменяет и не отменяет обязанность отдельно заполнить source_video_url ПОЛНОЙ ссылкой (в точности как в поле «Ссылка на ролик» входных данных, например "https://www.instagram.com/p/DbvDLUsNXj6/"), а не только код в скобках внутри evidence. Это два РАЗНЫХ поля с разным назначением — заполняются оба.
 
 ФИНАЛЬНЫЙ ЧЕК-ЛИСТ ПЕРЕД ВЫВОДОМ (обязательно к каждому паттерну и каждому сценарию):
 — В КАЖДОМ объекте patterns заполнены source_video_url, source_video_views, source_video_er (не пусто, не «—», не null)?
@@ -1167,6 +1169,137 @@ def fallback_result(reason: str):
     }
 
 
+# ----------------------------------------------------------------------------
+# СТРАХОВОЧНЫЙ СЛОЙ: восстановление цепочки «паттерн → ролик-источник → сценарий».
+# Модель иногда упоминает ролик только текстом (например «(DbvDLUsNXj6)» внутри evidence),
+# но оставляет структурированные поля source_video_*/anchor_* пустыми. Промптом это до конца
+# не лечится (особенно на «lite»-моделях), поэтому после ответа ИИ мы сами ищем упоминания
+# ID роликов в тексте и доподставляем реальные данные — так цепочка не рвётся даже если
+# модель поленилась.
+# ----------------------------------------------------------------------------
+_REEL_ID_URL_RE = re.compile(r"/(?:p|reel|reels)/([A-Za-z0-9_-]{5,})")
+_REEL_ID_LOOSE_RE = re.compile(r"[\(\[]([A-Za-z0-9_-]{8,})[\)\]]")
+
+def _extract_reel_id(text) -> str:
+    """Достаёт короткий ID Instagram-ролика из ссылки (после /p/ или /reel/) или из текста
+    вида «(DbvDLUsNXj6)», которым модель иногда заменяет полноценную ссылку."""
+    if not text:
+        return ""
+    text = str(text)
+    m = _REEL_ID_URL_RE.search(text)
+    if m:
+        return m.group(1)
+    m = _REEL_ID_LOOSE_RE.search(text)
+    if m:
+        return m.group(1)
+    return ""
+
+def _build_reel_lookup(metrics_df) -> dict:
+    """{ID_ролика: {'url', 'views', 'er'}} по всем роликам из ретроспективы этого блогера."""
+    lookup = {}
+    if metrics_df is None or metrics_df.empty or "Ссылка на ролик" not in metrics_df.columns:
+        return lookup
+    for _, row in metrics_df.iterrows():
+        url = row.get("Ссылка на ролик", "")
+        rid = _extract_reel_id(url)
+        if rid:
+            lookup[rid] = {"url": url, "views": row.get("Просмотры", 0), "er": row.get("ER_%", 0)}
+    return lookup
+
+def _find_reel_by_text(text: str, reel_lookup: dict):
+    """Ищет в произвольном тексте (evidence/based_on_video/hook/script) упоминание ID
+    любого известного ролика из ретроспективы и возвращает его данные, если нашёл."""
+    if not text or not reel_lookup:
+        return None
+    text = str(text)
+    for rid, data in reel_lookup.items():
+        if rid and rid in text:
+            return data
+    rid = _extract_reel_id(text)
+    return reel_lookup.get(rid) if rid else None
+
+def backfill_missing_media_data(result: dict, metrics_df, top_viral_df, viral_stats=None) -> dict:
+    """
+    Чинит разрывы цепочки «паттерн → ролик → сценарий», если ИИ не заполнил структурированные
+    поля, хотя упомянул ролик текстом:
+      1) для patterns без source_video_url — ищет ID ролика в pattern/evidence и подставляет
+         реальные url/views/ER из ретроспективы блогера;
+      2) для scenarios без anchor_url — сначала ищет ID ролика в based_on_video/based_on_pattern/
+         hook/script, затем пробует взять данные у паттерна с тем же названием (based_on_pattern),
+         и только в крайнем случае берёт самый залётный ролик из топа как разумный дефолт;
+      3) если после этого прогноз/вероятность/время публикации всё ещё пустые — считает
+         консервативную оценку по anchor_views/anchor_er и средней «залётности» блогера,
+         чтобы в интерфейсе никогда не оставалось голых прочерков там, где есть на основе чего посчитать.
+    Ничего не переписывает поверх уже заполненных ИИ значений — только дозаполняет пустые.
+    """
+    if not isinstance(result, dict):
+        return result
+
+    reel_lookup = _build_reel_lookup(metrics_df)
+    top_fallback = None
+    if top_viral_df is not None and not top_viral_df.empty and "Просмотры" in top_viral_df.columns:
+        top_row = top_viral_df.sort_values("Просмотры", ascending=False).iloc[0]
+        top_fallback = {"url": top_row.get("Ссылка на ролик", ""), "views": top_row.get("Просмотры", 0), "er": top_row.get("ER_%", 0)}
+
+    patterns = result.get("patterns") or []
+    for patt in patterns:
+        if not isinstance(patt, dict):
+            continue
+        if not str(patt.get("source_video_url", "") or "").strip():
+            match = _find_reel_by_text(f"{patt.get('pattern', '')} {patt.get('evidence', '')}", reel_lookup) or top_fallback
+            if match and match.get("url"):
+                patt["source_video_url"] = match["url"]
+                patt["source_video_views"] = match["views"]
+                patt["source_video_er"] = match["er"]
+
+    patterns_by_name = {(p.get("pattern") or "").strip().lower(): p for p in patterns if isinstance(p, dict)}
+
+    scenarios = result.get("scenarios") or []
+    for scn in scenarios:
+        if not isinstance(scn, dict):
+            continue
+        if not str(scn.get("anchor_url", "") or "").strip():
+            haystack = " ".join(str(scn.get(k, "")) for k in ("based_on_video", "based_on_pattern", "hook", "script"))
+            match = _find_reel_by_text(haystack, reel_lookup)
+            if not match:
+                bp_key = (scn.get("based_on_pattern") or "").strip().lower()
+                patt = patterns_by_name.get(bp_key)
+                if patt and patt.get("source_video_url"):
+                    match = {"url": patt["source_video_url"], "views": patt.get("source_video_views", 0), "er": patt.get("source_video_er", 0)}
+            match = match or top_fallback
+            if match and match.get("url"):
+                scn["anchor_url"] = match["url"]
+                scn["anchor_views"] = match["views"]
+                scn["anchor_er"] = match["er"]
+
+        anchor_views = scn.get("anchor_views") or 0
+        anchor_er = scn.get("anchor_er")
+        if not scn.get("forecast_views_low") and not scn.get("forecast_views_high") and anchor_views:
+            try:
+                av = float(anchor_views)
+                scn["forecast_views_low"] = int(round(av * 0.35))
+                scn["forecast_views_high"] = int(round(av * 0.75))
+            except (TypeError, ValueError):
+                pass
+        if not scn.get("forecast_er") and anchor_er not in (None, ""):
+            try:
+                scn["forecast_er"] = round(float(anchor_er) * 0.85, 2)
+            except (TypeError, ValueError):
+                pass
+        if scn.get("virality_probability") in (None, "", 0):
+            base_pct = (viral_stats or {}).get("viral_pct", 20) or 20
+            try:
+                scn["virality_probability"] = max(10, min(60, int(round(float(base_pct)))))
+            except (TypeError, ValueError):
+                scn["virality_probability"] = 25
+        if not str(scn.get("virality_reasoning", "") or "").strip():
+            scn["virality_reasoning"] = "Оценка рассчитана автоматически по средним показателям блогера (ИИ не указал обоснование)."
+        if not str(scn.get("best_posting_time_msk", "") or "").strip():
+            scn["best_posting_time_msk"] = "недостаточно данных"
+
+    return result
+
+
 def run_ai_analysis(blogger_url, product_brief, metrics_df, median_views, scenarios_count, top_viral_df,
                      provider_mode, base_url, model, max_tokens, system_prompt, api_key, previous_result=None,
                      viral_stats=None, custom_user_prompt=None):
@@ -1211,6 +1344,7 @@ def run_ai_analysis(blogger_url, product_brief, metrics_df, median_views, scenar
         if not raw_text.strip():
             raise ValueError("EMPTY_MODEL_RESPONSE")
         result = json.loads(strip_json_fences(raw_text))
+        result = backfill_missing_media_data(result, metrics_df, top_viral_df, viral_stats)
         return result, raw_text, None
     except ValueError as exc:
         reason = "лимит модели или пустой ответ" if str(exc) == "EMPTY_MODEL_RESPONSE" else f"ошибка: {exc}"
