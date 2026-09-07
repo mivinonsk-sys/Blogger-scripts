@@ -12,6 +12,7 @@ import statistics
 import html
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from urllib.parse import unquote
 
 import pandas as pd
 import streamlit as st
@@ -609,8 +610,22 @@ def count_manager_analyses(name):
 # monthlyUsageCycle.startAt/endAt). Поэтому вместо того чтобы самим высчитывать «когда лимит
 # освободится» по дате добавления ключа, мы прямо спрашиваем это у Apify (check_apify_key_live)
 # и сохраняем последний известный статус — так дата сброса всегда точная, а не предположение.
+def sanitize_apify_token(raw: str) -> str:
+    """В поле для токена иногда вставляют не сам токен, а целую ссылку, скопированную из консоли
+    Apify (например «https://api.apify.com/v2/actor-runs?token=apify_api_XXXX») — тогда реальный
+    токен спрятан внутри параметра token=. Вытаскиваем именно его, а не храним нерабочую ссылку
+    целиком: иначе любой вызов к Apify с таким «токеном» падает с 401, хотя сам ключ рабочий."""
+    text = (raw or "").strip().strip("\"'")
+    if not text:
+        return text
+    if "token=" in text:
+        tail = text.rsplit("token=", 1)[-1]
+        tail = tail.split("&")[0]
+        text = unquote(tail).strip()
+    return text
+
 def add_apify_key(token, label=None):
-    token = (token or "").strip()
+    token = sanitize_apify_token(token)
     if not token:
         return False, "Ключ не может быть пустым."
     if len(token) < 10:
@@ -643,6 +658,17 @@ def delete_apify_key(key_id):
         return True, "Ключ удалён."
     except Exception as exc:
         return False, f"Ошибка: {exc}"
+
+def update_apify_key_token(key_id, new_token):
+    """Самоисправление: если сохранённый «токен» на деле оказался целой ссылкой, из которой мы
+    смогли вытащить настоящий токен (см. sanitize_apify_token), перезаписываем запись — без этого
+    ошибка формата повторялась бы при каждой проверке и каждом реальном запросе."""
+    try:
+        with db_connect() as conn:
+            conn.execute("UPDATE apify_keys SET token = ? WHERE id = ?", (new_token, key_id))
+        return True
+    except Exception:
+        return False
 
 def update_apify_key_status(key_id, status, usage_pct=None, usage_detail=None, cycle_reset_at=None):
     """Записывает результат живой проверки лимитов (check_apify_key_live) — статус, % использования
@@ -1424,12 +1450,12 @@ def apify_get_first(item: dict, keys, default=""):
 
 class ApifyApiError(Exception):
     """Ошибка вызова Apify API с разобранным телом ответа. Все ошибки Apify API имеют формат
-    {"error": {"type": "...", "message": "..."}} (docs.apify.com) — зная error_type, можно точно
-    отличить «нет прав у токена» (insufficient-permissions), «актор требует согласия на оплату»
-    (например при Pay-Per-Result), «невалидный токен» (invalid-token) и т.д. друг от друга, вместо
-    того чтобы гадать по одному лишь HTTP-статусу (403 у Apify бывает по нескольким причинам сразу,
-    и НИ ОДНА из них — это не «кончились лимиты»: исчерпание месячного лимита Apify обычно отдаёт
-    отдельным статусом/сообщением "Monthly usage hard limit exceeded", а не голым 403)."""
+    {"error": {"type": "...", "message": "..."}} (docs.apify.com). ВАЖНО (проверено на реальном
+    ответе, а не только по документации): исчерпание месячного лимита Apify тоже может прийти как
+    403 (например error.type "platform-feature-disabled" с текстом "Monthly usage hard limit
+    exceeded") — то есть по одному лишь HTTP-статусу 402 vs 403 достоверно отличить «кончились
+    деньги» от «нет прав у токена» НЕЛЬЗЯ. Надёжный сигнал — текст message, поэтому classify ниже
+    смотрит в первую очередь на него, а не на код/тип."""
     def __init__(self, status_code, error_type=None, error_message=None):
         self.status_code = status_code
         self.error_type = error_type or ""
@@ -1440,22 +1466,25 @@ class ApifyApiError(Exception):
         super().__init__(label)
 
 
-def _wrap_apify_http_error(exc) -> ApifyApiError:
-    status = exc.response.status_code
-    error_type, error_message = None, None
+def _apify_error_from_response(resp):
+    """Достаёт (error_type, error_message) из тела ответа Apify, если оно распарсилось."""
     try:
-        body = exc.response.json()
+        body = resp.json()
         err = (body or {}).get("error") or {}
-        error_type = err.get("type")
-        error_message = err.get("message")
+        return err.get("type"), err.get("message")
     except Exception:
-        pass
-    return ApifyApiError(status, error_type, error_message)
+        return None, None
+
+
+def _wrap_apify_http_error(exc) -> ApifyApiError:
+    error_type, error_message = _apify_error_from_response(exc.response)
+    return ApifyApiError(exc.response.status_code, error_type, error_message)
 
 
 def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_days=None,
                            include_transcript=False, skip_pinned=True, skip_trial=True, timeout=300):
     if httpx is None: raise RuntimeError("Библиотека httpx не установлена")
+    token = sanitize_apify_token(token)
     actor_path = actor.strip("/").replace("/", "~")
     url = f"https://api.apify.com/v2/acts/{actor_path}/run-sync-get-dataset-items?token={token}"
     body = {"username": targets, "skipPinnedPosts": skip_pinned, "skipTrialReels": skip_trial, "includeTranscript": include_transcript}
@@ -1485,14 +1514,38 @@ APIFY_USAGE_RED_THRESHOLD_PCT = 97  # помечаем ключ красным �
 def check_apify_key_live(token, timeout=20):
     """Спрашивает у Apify реальный статус лимитов по токену. Возвращает dict:
     {"ok": bool, "status": "green"|"red"|"unknown", "usage_pct": float|None, "usage_detail": str,
-     "cycle_reset_at": str|None, "error": str|None}."""
+     "cycle_reset_at": str|None, "token_used": str, "error": str|None}.
+    token_used — токен ПОСЛЕ автоочистки (см. sanitize_apify_token): если он отличается от того,
+    что было передано, значит в базе хранилась ссылка вместо токена и её стоит перезаписать
+    (см. вызовы update_apify_key_token рядом с каждым использованием этой функции)."""
+    token = sanitize_apify_token(token)
     if httpx is None:
-        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": "Библиотека httpx не установлена"}
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token, "error": "Библиотека httpx не установлена"}
     if not token:
-        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": "Пустой токен"}
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token, "error": "Пустой токен"}
     try:
         resp = httpx.get(APIFY_LIMITS_URL, params={"token": token}, timeout=timeout)
-        resp.raise_for_status()
+    except Exception as exc:
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token,
+                "error": f"Не удалось связаться с Apify: {type(exc).__name__}: {str(exc)[:200]}"}
+
+    if resp.status_code >= 400:
+        error_type, error_message = _apify_error_from_response(resp)
+        combined = f"{error_message or ''} {error_type or ''}".lower()
+        if resp.status_code == 401 or "invalid" in combined and "token" in combined:
+            return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token,
+                    "error": "Токен недействителен (401) — проверьте, что вставлен настоящий API-токен Apify, а не ссылка/URL."}
+        if any(h in combined for h in ("monthly usage", "hard limit", "quota", "insufficient funds", "suspended")):
+            # Лимит исчерпан — Apify сообщил об этом прямо в теле ошибки (может прийти и с кодом 402,
+            # и с 403 — см. docstring ApifyApiError), поэтому доверяем тексту, а не статусу.
+            return {"ok": True, "status": "red", "usage_pct": None,
+                    "usage_detail": (error_message or "Месячный лимит исчерпан (по данным Apify)")[:250],
+                    "cycle_reset_at": None, "token_used": token, "error": None}
+        detail = error_message or f"HTTP {resp.status_code}"
+        if error_type: detail += f" [{error_type}]"
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token, "error": detail[:250]}
+
+    try:
         payload = (resp.json() or {}).get("data", {}) or {}
         limits = payload.get("limits", {}) or {}
         current = payload.get("current", {}) or {}
@@ -1507,65 +1560,70 @@ def check_apify_key_live(token, timeout=20):
         status = "red" if (usage_pct is not None and usage_pct >= APIFY_USAGE_RED_THRESHOLD_PCT) else "green"
         usage_detail = (
             f"${cur_usd:.2f} из ${max_usd:.2f} за текущий цикл ({usage_pct}%)"
-            if (cur_usd is not None and max_usd) else "нет данных об использовании"
+            if (cur_usd is not None and max_usd) else "нет данных об использовании (ответ Apify не содержит лимитов — токен, скорее всего, урезанного/ограниченного типа)"
         )
         return {
             "ok": True, "status": status, "usage_pct": usage_pct, "usage_detail": usage_detail,
-            "cycle_reset_at": cycle.get("endAt"), "error": None,
+            "cycle_reset_at": cycle.get("endAt"), "token_used": token, "error": None,
         }
     except Exception as exc:
-        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "token_used": token,
+                "error": f"Не удалось разобрать ответ Apify: {type(exc).__name__}: {str(exc)[:200]}"}
 
 
-# error.type Apify API, при которых проблема ТОЧНО связана именно с этим ключом/аккаунтом (лимиты,
-# права, аренда актора, невалидный токен, блокировка аккаунта) — со следующим ключом пула имеет
-# смысл пробовать сразу, не дожидаясь ежемесячного сброса:
-APIFY_KEY_BLOCKED_ERROR_TYPES = {
-    "insufficient-permissions", "invalid-token", "full-permission-actor-not-approved",
-}
-# Текстовые подсказки — на случай нестандартного/непарсящегося тела ответа (например 402 при
-# исчерпании лимита или отдельные тексты про аренду актора):
-APIFY_KEY_BLOCKED_TEXT_HINTS = [
-    "insufficient permission", "monthly usage", "usage hard limit", "must rent", "rent a paid actor",
-    "payment required", "exceeded", "quota", "insufficient funds", "suspended", "forbidden",
-]
+def _describe_apify_error(exc: Exception):
+    """Категоризирует одну ошибку вызова Apify: 'limit' — реально исчерпан месячный бюджет/квота
+    аккаунта; 'permission' — у токена нет прав на актор либо актор требует согласия на оплату
+    (аренда/Pay-Per-Result); 'auth' — токен недействителен или это в принципе не токен (например
+    в базу попала ссылка целиком); 'other' — явно не про ключ (опечатка в имени актора, обрыв сети).
+    Решение принимается в первую очередь по ТЕКСТУ сообщения от Apify — статус-код 402/403
+    ненадёжен: на практике оба варианта видели и для исчерпанных лимитов, и для проблем с правами."""
+    msg = str(exc).lower()
+    error_type = getattr(exc, "error_type", "") or ""
+    status_code = getattr(exc, "status_code", None)
+    if status_code == 401 or "invalid-token" in error_type or ("invalid" in msg and "token" in msg):
+        return "auth", "токен недействителен"
+    if any(h in msg for h in ("monthly usage", "hard limit", "insufficient funds", "quota exceeded", "usage hard limit")):
+        return "limit", "исчерпан месячный лимит аккаунта"
+    if (error_type in ("insufficient-permissions", "full-permission-actor-not-approved")
+            or "must rent" in msg or "rent a paid actor" in msg or "payment required" in msg
+            or "insufficient permission" in msg):
+        return "permission", "нет прав на актор либо не подтверждена оплата (аренда/Pay-Per-Result)"
+    if status_code in (401, 402, 403, 429):
+        return "permission", "ошибка доступа неясной природы (нет прав/лимиты/блокировка)"
+    return "other", str(exc)
 
-def classify_apify_error(exc: Exception) -> str:
-    """'key_problem' — ошибка похожа на то, что дело именно в этом ключе/аккаунте (лимиты, права
-    токена, неоплаченная аренда актора, блокировка) — переходим к следующему ключу пула и метим
-    текущий красным. 'other' — явно не про ключ (опечатка в имени актора, обрыв сети): следующий
-    ключ пула тоже пробуем (вдруг поможет), но красным не метим — это не его вина."""
-    if isinstance(exc, ApifyApiError):
-        if exc.error_type in APIFY_KEY_BLOCKED_ERROR_TYPES:
-            return "key_problem"
-        if exc.status_code in (401, 402, 403, 429):
-            return "key_problem"
-    if any(hint in str(exc).lower() for hint in APIFY_KEY_BLOCKED_TEXT_HINTS):
-        return "key_problem"
-    return "other"
+
+class ApifyAllKeysFailedError(RuntimeError):
+    """Поднимается, когда весь пул Apify-ключей перебран и НИ ОДИН не сработал. Несёт полный
+    attempts_log (что произошло с каждым ключом по порядку), чтобы UI мог показать не только
+    последнюю ошибку, а всю картину — сколько ключей испробовано и почему каждый не подошёл."""
+    def __init__(self, message, attempts_log):
+        super().__init__(message)
+        self.attempts_log = attempts_log
 
 
 def fetch_reels_via_apify_with_failover(actor, targets, results_limit=None, lookback_days=None,
                                          include_transcript=False, timeout=300):
-    """Как fetch_reels_via_apify, но перебирает весь сохранённый пул Apify-ключей вместо одного
+    """Как fetch_reels_via_apify, но перебирает ВЕСЬ сохранённый пул Apify-ключей вместо одного
     токена — тот же принцип автопереключения, что уже используется для моделей ИИ (см.
-    call_role_with_failover): пробуем ключи в порядке предпочтения (зелёные → непроверенные →
-    красные); при ЛЮБОЙ ошибке сразу переходим к следующему ключу (без потери уже введённых данных
-    формы и без падения всего анализа), а если ошибка похожа на проблему именно этого ключа —
-    перепроверяем его напрямую у Apify и фиксируем реальную причину в базе. Если ВСЕ ключи в пуле
-    упали с одной и той же ошибкой доступа (403/insufficient-permissions) — это почти наверняка НЕ
-    исчерпание лимитов (для лимитов Apify обычно отдаёт отдельное сообщение "Monthly usage hard
-    limit exceeded"), а проблема с правами токена или неоплаченной арендой/Pay-Per-Result актора —
-    об этом отдельно и понятно сообщаем, а не молча ждём «сброса», которого не будет.
+    call_role_with_failover): пробует ключи в порядке предпочтения (зелёные → непроверенные →
+    красные) один за другим, пока не найдёт рабочий или не кончится пул — без потери уже введённых
+    данных формы и без падения всего анализа при сбое отдельного ключа. Если у сохранённого ключа
+    формат оказался «ссылка вместо токена» — чинит его в базе на лету (см. sanitize_apify_token) и
+    пробует уже исправленным. Если ВЕСЬ пул исчерпан — поднимает ApifyAllKeysFailedError с точным,
+    по категориям (лимиты / права / невалидный токен), объяснением и полным логом попыток.
     Возвращает (items, token_used, attempts_log)."""
     pool = get_apify_key_pool()
     if not pool:
         raise RuntimeError("Не добавлено ни одного Apify-ключа — добавьте его в разделе «Редактор менеджеров → Ключи Apify».")
     attempts_log = []
-    last_exc = None
     errors_seen = []
     for key_rec in pool:
-        token = key_rec["token"]
+        token = sanitize_apify_token(key_rec["token"])
+        if token != key_rec["token"]:
+            update_apify_key_token(key_rec["id"], token)
+            attempts_log.append(f"Apify: ключ …{token[-4:] if len(token) >= 4 else token} — формат исправлен автоматически (в базе была ссылка вместо самого токена)")
         token_tail = token[-4:] if len(token) >= 4 else token
         try:
             items = fetch_reels_via_apify(
@@ -1575,40 +1633,61 @@ def fetch_reels_via_apify_with_failover(actor, targets, results_limit=None, look
             attempts_log.append(f"Apify: сработал ключ …{token_tail}")
             return items, token, attempts_log
         except Exception as exc:
-            last_exc = exc
             errors_seen.append(exc)
+            category, category_text = _describe_apify_error(exc)
             detail = f"{exc.error_type + ': ' if isinstance(exc, ApifyApiError) and exc.error_type else ''}{exc}"
-            if classify_apify_error(exc) == "key_problem":
-                # Статус всегда переводим в красный по факту наблюдаемого сбоя — проверка лимитов
-                # (/users/me/limits) видит только денежный бюджет и может ошибочно показать «всё ок»,
-                # если проблема на самом деле в правах токена, а не в деньгах; поэтому не даём такой
-                # проверке молча перезаписать красный обратно в зелёный — только явное «Проверить».
+            if category != "other":
+                # Статус всегда переводим в красный по факту наблюдаемого сбоя. Живая проверка лимитов
+                # видит только денежный бюджет и может ошибочно показать «всё ок», если проблема на
+                # самом деле в правах токена, а не в деньгах — поэтому не даём такой проверке молча
+                # перезаписать красный обратно в зелёный, только явное «Проверить» это делает.
                 live = check_apify_key_live(token)
                 combined_detail = f"{live.get('usage_detail')} · " if live.get("ok") and live.get("usage_detail") else ""
                 update_apify_key_status(
                     key_rec["id"], "red",
                     usage_pct=live.get("usage_pct"),
-                    usage_detail=f"{combined_detail}ошибка при запуске: {detail}"[:300],
+                    usage_detail=f"{combined_detail}{category_text}: {detail}"[:300],
                     cycle_reset_at=live.get("cycle_reset_at"),
                 )
-                attempts_log.append(f"Apify: ключ …{token_tail} — {detail} — похоже на проблему с этим ключом, помечен красным, пробую следующий")
+                attempts_log.append(f"Apify: ключ …{token_tail} — {detail} ({category_text}) — помечен красным, пробую следующий")
             else:
                 attempts_log.append(f"Apify: ключ …{token_tail} — {detail} (не похоже на проблему с ключом, но всё равно пробую следующий)")
 
-    if errors_seen and all(
-        isinstance(e, ApifyApiError) and (e.status_code == 403 or e.error_type in APIFY_KEY_BLOCKED_ERROR_TYPES)
-        for e in errors_seen
-    ):
-        seen_types = ", ".join(sorted({e.error_type for e in errors_seen if isinstance(e, ApifyApiError) and e.error_type})) or "403 Forbidden"
-        raise RuntimeError(
-            f"Все ключи Apify в пуле вернули одну и ту же ошибку доступа ({seen_types}) — это НЕ похоже на "
-            f"исчерпание месячных лимитов (для этого Apify обычно отдаёт отдельное сообщение "
-            f"«Monthly usage hard limit exceeded»). Вероятная причина: у токена(ов) нет прав на запуск "
-            f"акторов, либо актор «{actor}» требует явного согласия на оплату (Pay-Per-Result/аренда) — "
-            f"откройте страницу актора в консоли Apify под каждым аккаунтом и один раз примите условия "
-            f"использования («Try for free»), либо перевыпустите токен с полными правами."
+    categories_seen = {_describe_apify_error(e)[0] for e in errors_seen} if errors_seen else set()
+    tried_n = len(pool)
+    if categories_seen == {"limit"}:
+        message = (
+            f"Все {tried_n} ключ(ей) Apify в пуле сейчас исчерпали месячный лимит — подождите сброса цикла "
+            f"(дата видна у каждого ключа на вкладке «Ключи Apify») или добавьте ключ от другого аккаунта Apify "
+            f"(токены одного и того же аккаунта делят общий лимит — новый токен того же аккаунта не поможет)."
         )
-    raise last_exc if last_exc is not None else RuntimeError("Не удалось получить данные ни по одному Apify-ключу")
+    elif categories_seen == {"auth"}:
+        message = (
+            f"Все {tried_n} ключ(ей) Apify оказались недействительны (401). Если в поле был вставлен не сам "
+            f"токен, а ссылка — формат уже исправлен автоматически; если ошибка сохраняется — перевыпустите "
+            f"токен в консоли Apify (Settings → Integrations) и добавьте заново."
+        )
+    elif categories_seen == {"permission"}:
+        message = (
+            f"Все {tried_n} ключ(ей) Apify вернули ошибку доступа, не похожую на исчерпание лимитов — "
+            f"вероятно, у токена(ов) нет прав на запуск акторов, либо актор «{actor}» требует явного "
+            f"согласия на оплату (Pay-Per-Result/аренда). Откройте страницу актора в консоли Apify под "
+            f"каждым аккаунтом и один раз примите условия использования («Try for free»), либо перевыпустите "
+            f"токен с полными правами."
+        )
+    elif categories_seen == {"other"} or not categories_seen:
+        last_text = str(errors_seen[-1]) if errors_seen else "неизвестная ошибка"
+        message = (
+            f"Не удалось получить данные ни по одному из {tried_n} испробованных Apify-ключей, и похоже, "
+            f"дело не в самих ключах (не лимиты, не права) — вероятно, опечатка в имени актора «{actor}», "
+            f"сбой сети или сервиса Apify. Последняя ошибка: {last_text}"
+        )
+    else:
+        message = (
+            f"Не удалось получить данные ни по одному из {tried_n} испробованных Apify-ключей — причины разные "
+            f"у разных ключей (подробности по каждому — ниже)."
+        )
+    raise ApifyAllKeysFailedError(message, attempts_log)
 
 
 def apify_items_to_dataframe(items):
@@ -3302,9 +3381,12 @@ else:
                         new_rec = next((k for k in get_apify_keys() if k["token"] == token_to_add), None)
                         if new_rec:
                             live = check_apify_key_live(token_to_add)
+                            if live.get("token_used") and live["token_used"] != new_rec["token"]:
+                                update_apify_key_token(new_rec["id"], live["token_used"])
                             update_apify_key_status(
                                 new_rec["id"], live.get("status") if live.get("ok") else "unknown",
-                                usage_pct=live.get("usage_pct"), usage_detail=live.get("usage_detail"),
+                                usage_pct=live.get("usage_pct"),
+                                usage_detail=live.get("usage_detail") or live.get("error"),
                                 cycle_reset_at=live.get("cycle_reset_at"),
                             )
                         st.success(msg)
@@ -3319,9 +3401,14 @@ else:
                 if st.button("🔄 Проверить все ключи", use_container_width=True, key="check_all_apify_keys"):
                     for _k in apify_keys_list:
                         _live = check_apify_key_live(_k["token"])
+                        if _live.get("token_used") and _live["token_used"] != _k["token"]:
+                            # В базе была ссылка вместо самого токена (частая ошибка при копировании
+                            # из консоли Apify) — чиним на лету, чтобы автопереключение видело рабочий ключ.
+                            update_apify_key_token(_k["id"], _live["token_used"])
                         update_apify_key_status(
                             _k["id"], _live.get("status") if _live.get("ok") else "unknown",
-                            usage_pct=_live.get("usage_pct"), usage_detail=_live.get("usage_detail"),
+                            usage_pct=_live.get("usage_pct"),
+                            usage_detail=_live.get("usage_detail") or _live.get("error"),
                             cycle_reset_at=_live.get("cycle_reset_at"),
                         )
                     st.rerun()
@@ -3354,13 +3441,18 @@ else:
                     with kc1:
                         if st.button("🔄 Проверить", key=f"check_apify_{k['id']}", use_container_width=True):
                             live = check_apify_key_live(token)
+                            healed = bool(live.get("token_used") and live["token_used"] != token)
+                            if healed:
+                                update_apify_key_token(k["id"], live["token_used"])
                             if live.get("ok"):
                                 update_apify_key_status(
                                     k["id"], live["status"], usage_pct=live.get("usage_pct"),
                                     usage_detail=live.get("usage_detail"), cycle_reset_at=live.get("cycle_reset_at"),
                                 )
-                                st.success("🟢 Лимиты есть." if live["status"] == "green" else "🔴 Лимит почти/полностью исчерпан.")
+                                heal_note = " (формат токена в базе исправлен — была вставлена ссылка вместо токена)" if healed else ""
+                                st.success(("🟢 Лимиты есть." if live["status"] == "green" else "🔴 Лимит почти/полностью исчерпан.") + heal_note)
                             else:
+                                update_apify_key_status(k["id"], "unknown", usage_detail=live.get("error"))
                                 st.error(f"Не удалось проверить: {live.get('error')}")
                             st.rerun()
                     with kc2:
@@ -3519,6 +3611,7 @@ else:
             else:
                 apify_debug_raw = None
                 apify_debug_error = None
+                apify_debug_attempts = None
                 raw_df = None
 
                 if active_data_source_mode == "manual":
@@ -3540,12 +3633,18 @@ else:
                                 raw_df = apify_items_to_dataframe(items)
                                 if len(apify_failover_log) > 1:
                                     st.caption(f"🔁 Переключился на другой Apify-ключ (…{apify_token_used[-4:]}) — предыдущий, похоже, исчерпал лимит.")
+                            except ApifyAllKeysFailedError as exc:
+                                apify_debug_error = str(exc)
+                                apify_debug_attempts = exc.attempts_log
                             except Exception as exc:
                                 apify_debug_error = f"{type(exc).__name__}: {exc}"
 
                 if apify_debug_raw is not None or apify_debug_error is not None:
-                    with st.expander("🔍 Сырой ответ Apify (для отладки)"):
+                    with st.expander("🔍 Сырой ответ Apify (для отладки)", expanded=bool(apify_debug_error)):
                         if apify_debug_error: st.code(apify_debug_error, language="text")
+                        if apify_debug_attempts:
+                            st.markdown("**Что произошло с каждым ключом из пула (по порядку):**")
+                            st.code("\n".join(apify_debug_attempts), language="text")
                         if apify_debug_raw is not None: st.code(json.dumps(apify_debug_raw, ensure_ascii=False, indent=2) if not isinstance(apify_debug_raw, str) else apify_debug_raw, language="json")
 
                 if raw_df is not None and not apify_debug_error:
@@ -3602,6 +3701,10 @@ else:
                                             top_viral_df["Транскрипция (если есть)"] = top_viral_df["Ссылка на ролик"].map(
                                                 lambda u: transcript_map.get(u) or top_viral_df.loc[top_viral_df["Ссылка на ролик"] == u, "Транскрипция (если есть)"].values[0]
                                             )
+                                        except ApifyAllKeysFailedError as exc:
+                                            st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию для {len(missing_links)} ролика(ов): {exc}. Эти ролики пойдут без текста речи.</div>""", unsafe_allow_html=True)
+                                            with st.expander("🔍 Что произошло с каждым Apify-ключом при попытке транскрипции"):
+                                                st.code("\n".join(exc.attempts_log), language="text")
                                         except Exception as exc:
                                             st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию для {len(missing_links)} ролика(ов) ({type(exc).__name__}: {exc}). Эти ролики пойдут без текста речи.</div>""", unsafe_allow_html=True)
 
