@@ -864,6 +864,36 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
   ]
 }}""".format(humanize_block=_HUMANIZE_BLOCK_SCRIPTWRITER)
 
+DEFAULT_EDITOR_SYSTEM_PROMPT = """Ты — Редактор и контролёр качества рекламных сценариев для Instagram Reels. Ты работаешь третьим в цепочке: Аналитик находит паттерны, Сценарист пишет сценарий, а ты проверяешь ОДИН готовый сценарий перед тем, как он попадёт к менеджеру и блогеру. Твоя задача — не пропустить слабый сценарий, который не даст максимум охвата и потенциала блогера.
+
+На вход поступает: (1) бриф продукта, (2) анатомия паттерна-донора от аналитика (evidence — что конкретно происходит в оригинальном ролике), (3) сам сценарий на проверку (JSON).
+
+═══════════════════════════════════
+КРИТЕРИИ ПРОВЕРКИ
+═══════════════════════════════════
+1. FIT. Поле fit_score должно быть "высокий". Если в сценарии стоит "средний" или "низкий", но при этом anchor_url заполнен (то есть реальный подходящий ролик-донор есть) — это ВСЕГДА повод для verdict="revise": цель — выжать максимум потенциала блогера, компромиссные сценарии не отправляются менеджеру. Единственное исключение: если сценарий по сути является честным отказом ("подходящего материала у этого блогера нет") — тогда его fit специально низкий и это НЕ повод для revise, отправляй verdict="pass".
+2. ПРИВЯЗКА К АНАТОМИИ ПАТТЕРНА. Хук и сценарий должны держаться на конкретных деталях из evidence паттерна (структура хука, темп, визуальный приём, лексика блогера). Если сценарий можно один в один вставить под любой другой товар или любого другого блогера без потери смысла — это провал уникальности, verdict="revise".
+3. ЖИВОЙ, НЕ-ИИ ТЕКСТ. Проверяй hook, script и caption на признаки шаблонного ИИ-текста: канцелярские обороты («играет ключевую роль», «в современном мире», «важно отметить»), тройные перечисления («быстро, стильно, удобно»), тире как разделитель посреди фразы, дежурные оптимистичные концовки, рекламные клише («это не просто майка, это...», «идеальное решение»). Если такое есть — verdict="revise" с конкретным указанием, что переписать.
+4. ЛЕГАЛЬНОСТЬ. Поле ad_marking_note должно содержать реальную инструкцию по маркировке рекламы, а не быть пустым или формальной отпиской.
+5. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный и нативный — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет и лимиты API).
+
+Если verdict="revise" — поле revision_notes должно быть конкретной инструкцией для сценариста: что именно усилить или переписать (не общие слова вроде «сделай лучше», а конкретика: «хук не привязан к анатомии паттерна — используй деталь из evidence про смену кадра на 0.5 секунде», «fit средний из-за того что товар вставлен поверх сценария, а не внутрь — переставь появление майки в момент смены образа, как в оригинале»).
+
+Отвечай СТРОГО в формате валидного JSON. КАТЕГОРИЧЕСКИ ЗАПРЕЩЕНО: markdown-разметка, пояснения до или после кода.
+Схема:
+{
+  "verdict": "pass|revise",
+  "reason": "строка — краткая причина решения",
+  "revision_notes": "строка — конкретные правки для сценариста (пусто, если verdict=pass)"
+}"""
+DEFAULT_EDITOR_AUTO_MODELS = [
+    "z-ai/glm-5.2:free",
+    "minimax/minimax-m2.7:free",
+    "google/gemma-4-31b-it:free",
+    "nvidia/nemotron-3-super-120b-a12b:free",
+    "minimax/minimax-m3:free",
+]
+
 init_db()
 
 if "admin_logged_in" not in st.session_state:
@@ -931,6 +961,17 @@ if "settings_loaded" not in st.session_state:
         "cfg_scriptwriter_auto_models_text", model_list_to_text(DEFAULT_SCRIPTWRITER_AUTO_MODELS)
     )
     st.session_state.cfg_scriptwriter_system_prompt = load_setting_str("cfg_scriptwriter_system_prompt", DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT)
+
+    # --- Роль «Редактор» (контроль качества сценариев, fit_score) ---
+    st.session_state.cfg_editor_mode = load_setting_str("cfg_editor_mode", "auto")
+    st.session_state.cfg_editor_manual_model = load_setting_str("cfg_editor_manual_model", DEFAULT_MANUAL_MODEL)
+    st.session_state.cfg_editor_auto_models_text = load_setting_str(
+        "cfg_editor_auto_models_text", model_list_to_text(DEFAULT_EDITOR_AUTO_MODELS)
+    )
+    st.session_state.cfg_editor_system_prompt = load_setting_str("cfg_editor_system_prompt", DEFAULT_EDITOR_SYSTEM_PROMPT)
+    st.session_state.cfg_qc_enabled = load_setting_bool("cfg_qc_enabled", True)
+    st.session_state.cfg_qc_max_revisions = load_setting_int("cfg_qc_max_revisions", 1)
+    st.session_state.cfg_sound_enabled = load_setting_bool("cfg_sound_enabled", True)
 
     st.session_state.cfg_data_source_mode = load_setting_str("cfg_data_source_mode", "apify")
     st.session_state.cfg_apify_token = load_setting_str("cfg_apify_token", "")
@@ -1412,12 +1453,15 @@ def build_scriptwriter_user_prompt(blogger_url, product_brief, metrics_df, media
 
 
 def build_scriptwriter_user_prompt_single(blogger_url, product_brief, metrics_df, median_views, top_viral_df,
-                                           patterns, viral_stats, all_scenarios, target_index):
+                                           patterns, viral_stats, all_scenarios, target_index, editor_feedback=None):
     """
-    Промпт для точечного обновления ОДНОГО сценария (кнопка «🔄 Обновить сценарий» у конкретной карточки).
+    Промпт для точечного обновления ОДНОГО сценария (кнопка «🔄 Обновить сценарий» у конкретной карточки,
+    либо автоматический перезапуск после замечания редактора при QC-проверке).
     Не трогает остальные уже готовые сценарии и не запускает аналитика заново — просит сценариста вернуть
     ровно 1 новый сценарий взамен указанного, по возможности на основе другого паттерна из уже готового
     списка, чтобы не дублировать доноров уже существующих сценариев.
+    editor_feedback (опционально) — конкретные замечания редактора (revision_notes), которые нужно
+    обязательно устранить в новой версии, с обязательным требованием довести fit_score до "высокий".
     """
     table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
     viral_block = ""
@@ -1459,10 +1503,17 @@ def build_scriptwriter_user_prompt_single(blogger_url, product_brief, metrics_df
         f"Остальные сценарии этого блогера уже готовы и НЕ пересоздаются — по возможности выбери другой "
         f"паттерн из переданного списка, чтобы не дублировать доноров уже использованных сценариев:\n{other_lines}"
     )
+    editor_block = ""
+    if editor_feedback:
+        editor_block = (
+            "\n\n⚠️ ЗАМЕЧАНИЕ РЕДАКТОРА (обязательно к исправлению — предыдущая версия этого сценария "
+            "была отклонена контролем качества, цель — довести fit_score строго до \"высокий\" и убрать "
+            f"все отмеченные слабые места):\n{editor_feedback}"
+        )
     return (
         f"Блогер: {blogger_url}\nМедиана просмотров: {median_views:.0f}\n\n"
         f"Бриф о товаре:\n{product_brief}\n\nВсе загруженные ролики:\n"
-        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{instruction}"
+        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{instruction}{editor_block}"
     )
 
 
@@ -1508,10 +1559,10 @@ def run_scriptwriter_stage(blogger_url, product_brief, metrics_df, median_views,
 def run_scriptwriter_single_stage(blogger_url, product_brief, metrics_df, median_views, top_viral_df, patterns,
                                    viral_stats, all_scenarios, target_index,
                                    provider_mode, base_url, api_key, mode, manual_model, auto_models,
-                                   max_tokens, system_prompt):
+                                   max_tokens, system_prompt, editor_feedback=None):
     user_prompt = build_scriptwriter_user_prompt_single(
         blogger_url, product_brief, metrics_df, median_views, top_viral_df, patterns, viral_stats,
-        all_scenarios, target_index,
+        all_scenarios, target_index, editor_feedback=editor_feedback,
     )
     parsed, raw_text, model_used, attempts_log = call_role_with_failover(
         "Сценарист", provider_mode, base_url, api_key, mode, manual_model, auto_models,
@@ -1522,6 +1573,122 @@ def run_scriptwriter_single_stage(blogger_url, product_brief, metrics_df, median
         return fallback_scriptwriter_result(reason), raw_text, None, attempts_log
     parsed.setdefault("scenarios", [])
     return parsed, raw_text, model_used, attempts_log
+
+
+# ============================================================================
+# РОЛЬ «РЕДАКТОР»: контроль качества сценариев, гейт fit_score = "высокий"
+# ============================================================================
+def find_pattern_evidence(patterns, pattern_name) -> str:
+    """Ищет анатомию паттерна-донора по его имени (based_on_pattern сценария) в списке паттернов
+    аналитика и возвращает evidence — то есть конкретный разбор оригинального вирусного ролика.
+    Если точного совпадения нет, отдаёт evidence первого паттерна (лучше частичный контекст, чем никакой)."""
+    if not patterns:
+        return ""
+    name = (pattern_name or "").strip().lower()
+    if name:
+        for p in patterns:
+            if str(p.get("pattern", "")).strip().lower() == name:
+                return p.get("evidence", "")
+        for p in patterns:
+            if name in str(p.get("pattern", "")).strip().lower() or str(p.get("pattern", "")).strip().lower() in name:
+                return p.get("evidence", "")
+    return patterns[0].get("evidence", "") if patterns else ""
+
+
+def build_editor_user_prompt(scenario, pattern_evidence, product_brief):
+    return (
+        f"Бриф о товаре:\n{product_brief}\n\n"
+        f"Анатомия паттерна-донора (от аналитика):\n{pattern_evidence or '(не найдена — оцени сценарий по остальным критериям)'}\n\n"
+        f"Сценарий на проверку (JSON):\n{json.dumps(scenario, ensure_ascii=False, indent=2)}"
+    )
+
+
+def fallback_editor_result(reason: str):
+    """Fail-open: если редактор недоступен (ключ/лимиты/сеть), не блокируем выдачу сценариев —
+    пропускаем как есть, чтобы отказ QC-роли не парализовал всю цепочку."""
+    return {"verdict": "pass", "reason": f"Редактор недоступен ({reason}) — пропущено без проверки.", "revision_notes": ""}
+
+
+def run_editor_stage(scenario, pattern_evidence, product_brief,
+                      provider_mode, base_url, api_key, mode, manual_model, auto_models,
+                      max_tokens, system_prompt):
+    user_prompt = build_editor_user_prompt(scenario, pattern_evidence, product_brief)
+    parsed, raw_text, model_used, attempts_log = call_role_with_failover(
+        "Редактор", provider_mode, base_url, api_key, mode, manual_model, auto_models,
+        system_prompt, user_prompt, max_tokens, required_keys=("verdict",),
+    )
+    if parsed is None:
+        reason = attempts_log[-1].split(" — ", 1)[-1] if attempts_log else "неизвестная ошибка"
+        return fallback_editor_result(reason), raw_text, None, attempts_log
+    parsed.setdefault("verdict", "pass")
+    parsed.setdefault("reason", "")
+    parsed.setdefault("revision_notes", "")
+    return parsed, raw_text, model_used, attempts_log
+
+
+def run_scenario_qc_pass(scenarios, patterns, blogger_url, product_brief, metrics_df, median_views, top_viral_df,
+                          viral_stats, provider_mode, base_url, api_key,
+                          editor_mode, editor_manual_model, editor_auto_models, editor_max_tokens, editor_system_prompt,
+                          scriptwriter_mode, scriptwriter_manual_model, scriptwriter_auto_models,
+                          scriptwriter_max_tokens, scriptwriter_system_prompt,
+                          max_revisions=1, only_indices=None):
+    """
+    Прогоняет каждый сценарий через Редактора и, если он требует доработки (verdict="revise"),
+    просит Сценариста переписать РОВНО этот сценарий с учётом revision_notes — до max_revisions
+    попыток на сценарий. Честные отказы (anchor_url пустой — «подходящего материала нет») не трогает.
+    Если после всех попыток сценарий всё ещё не прошёл — помечает его scenario["_qc_flag"] с причиной,
+    но не выбрасывает (лучше показать менеджеру с пометкой, чем потерять результат работы ИИ и API-лимиты).
+    Возвращает (scenarios, qc_log) — qc_log — список текстовых строк для истории/отладки.
+    """
+    qc_log = []
+    if not scenarios:
+        return scenarios, qc_log
+    indices = only_indices if only_indices is not None else range(len(scenarios))
+    for idx in indices:
+        if idx < 0 or idx >= len(scenarios):
+            continue
+        scenario = scenarios[idx]
+        if not str(scenario.get("anchor_url", "")).strip():
+            # честный отказ («подходящего материала у блогера нет») — не подлежит QC-гейту
+            continue
+        scenario.pop("_qc_flag", None)
+        pattern_evidence = find_pattern_evidence(patterns, scenario.get("based_on_pattern", ""))
+        attempts = 0
+        while attempts <= max_revisions:
+            verdict_result, _, editor_model, editor_attempts_log = run_editor_stage(
+                scenario, pattern_evidence, product_brief,
+                provider_mode, base_url, api_key, editor_mode, editor_manual_model, editor_auto_models,
+                editor_max_tokens, editor_system_prompt,
+            )
+            qc_log.extend(editor_attempts_log)
+            verdict = str(verdict_result.get("verdict", "pass")).strip().lower()
+            if verdict != "revise":
+                qc_log.append(f"Сценарий «{scenario.get('title', '')}»: редактор — pass" + (f" ({verdict_result.get('reason', '')})" if verdict_result.get("reason") else ""))
+                break
+            if attempts >= max_revisions:
+                scenario["_qc_flag"] = verdict_result.get("reason") or "Не прошёл контроль качества (fit/уникальность), лимит переписываний исчерпан"
+                qc_log.append(f"Сценарий «{scenario.get('title', '')}»: лимит переписываний исчерпан — оставлен с пометкой")
+                break
+            qc_log.append(f"Сценарий «{scenario.get('title', '')}»: редактор просит доработку — {verdict_result.get('revision_notes', '')}")
+            rewritten, _, sw_model, sw_attempts_log = run_scriptwriter_single_stage(
+                blogger_url, product_brief, metrics_df, median_views, top_viral_df, patterns, viral_stats,
+                scenarios, idx,
+                provider_mode, base_url, api_key, scriptwriter_mode, scriptwriter_manual_model,
+                scriptwriter_auto_models, scriptwriter_max_tokens, scriptwriter_system_prompt,
+                editor_feedback=verdict_result.get("revision_notes", ""),
+            )
+            qc_log.extend(sw_attempts_log)
+            new_list = rewritten.get("scenarios") or []
+            if sw_model and new_list:
+                scenarios[idx] = new_list[0]
+                scenario = scenarios[idx]
+                pattern_evidence = find_pattern_evidence(patterns, scenario.get("based_on_pattern", ""))
+            else:
+                scenario["_qc_flag"] = "Не удалось переписать сценарий (сценарист недоступен) — показан черновой вариант"
+                qc_log.append(f"Сценарий «{scenario.get('title', '')}»: переписать не удалось, сценарист недоступен")
+                break
+            attempts += 1
+    return scenarios, qc_log
 
 
 # ----------------------------------------------------------------------------
@@ -1759,6 +1926,16 @@ def render_full_result(metrics_df, top_viral_df, result, enable_scenario_regen=F
             if enable_scenario_regen:
                 if st.button("🔄 Обновить сценарий", key=f"{regen_key_prefix}_regen_{idx}", use_container_width=True):
                     clicked_regen_index = idx
+
+        qc_flag = scenario.get("_qc_flag")
+        if qc_flag:
+            st.markdown(
+                f"""<div style="background:rgba(234,179,8,0.12); border:1px solid rgba(234,179,8,0.4);
+                    border-radius:8px; padding:8px 12px; margin:4px 0 8px; font-size:13px; color:#eab308;">
+                    ⚠️ Не прошёл автоматический контроль качества: {html.escape(str(qc_flag))}
+                    </div>""",
+                unsafe_allow_html=True,
+            )
 
         st.markdown(f"""
             <div class="ai-report-glass fade-in-container" style="margin-top:-8px;">
@@ -2065,6 +2242,42 @@ def play_success_animation(message="Доступ разрешён"):
       setTimeout(function() {{ document.getElementById('pac-stage').style.display = 'none'; document.getElementById('success-stage').style.display = 'flex'; }}, 2000);
     </script>
     """, height=240)
+
+
+def play_completion_sound():
+    """Звуковой сигнал об окончании полного цикла (парсинг → анализ → сценарии) — синтезируется
+    прямо в браузере через Web Audio API (без внешних аудио-файлов), в духе олдскульных ICQ-«О-Оуу»-
+    уведомлений начала 2000-х: два игривых восходящих чирпа друг за другом."""
+    components.html("""
+    <script>
+    (function() {
+      try {
+        var Ctx = window.AudioContext || window.webkitAudioContext;
+        if (!Ctx) return;
+        var ctx = new Ctx();
+        function chirp(startTime, f1, f2, dur, gainPeak) {
+          var osc = ctx.createOscillator();
+          var gain = ctx.createGain();
+          osc.type = "sine";
+          osc.frequency.setValueAtTime(f1, startTime);
+          osc.frequency.exponentialRampToValueAtTime(f2, startTime + dur);
+          gain.gain.setValueAtTime(0.0001, startTime);
+          gain.gain.exponentialRampToValueAtTime(gainPeak, startTime + dur * 0.25);
+          gain.gain.exponentialRampToValueAtTime(0.0001, startTime + dur);
+          osc.connect(gain);
+          gain.connect(ctx.destination);
+          osc.start(startTime);
+          osc.stop(startTime + dur + 0.02);
+        }
+        var now = ctx.currentTime + 0.02;
+        // "О" — короткий взлёт тона
+        chirp(now, 520, 880, 0.14, 0.18);
+        // "-Оуу" — второй, более протяжный взлёт следом (пауза между ними — как в олдскульной аське)
+        chirp(now + 0.20, 660, 1180, 0.26, 0.20);
+      } catch (e) { /* тихо игнорируем — звук необязателен для работы приложения */ }
+    })();
+    </script>
+    """, height=0)
 
 
 def save_analysis(manager, blogger_url, blogger_handle, data_source, model_used_analyst, model_used_scenarist,
@@ -2374,6 +2587,34 @@ else:
         st.sidebar.caption("Бесплатные модели на OpenRouter регулярно меняются — сверяйтесь со списком на openrouter.ai/models?q=free и обновляйте списки выше по необходимости.")
         st.sidebar.markdown("---")
 
+        st.sidebar.markdown("### <i class='fa-solid fa-magnifying-glass-chart'></i> Роль «Редактор» (контроль качества)", unsafe_allow_html=True)
+        st.sidebar.caption(
+            "Редактор проверяет каждый готовый сценарий: fit_score должен быть «высокий» (иначе — правки), "
+            "плюс уникальность и живой текст. Если сценарий не проходит — Сценарист переписывает его "
+            "с учётом замечаний, в пределах лимита попыток ниже."
+        )
+        qc_enabled_input = st.sidebar.checkbox(
+            "Включить проверку качества сценариев (гейт «Fit: высокий»)", value=st.session_state.cfg_qc_enabled,
+        )
+        qc_max_revisions_input = st.sidebar.number_input(
+            "Макс. переписываний одного сценария при отказе редактора", min_value=0, max_value=4,
+            value=st.session_state.cfg_qc_max_revisions, step=1,
+            help="0 — редактор только помечает слабые сценарии, но не запускает переписывание.",
+        )
+        editor_mode_input, editor_manual_model_input, editor_auto_models_text_input = render_role_model_settings(
+            "editor", "🕵️ Редактор", provider_mode_input,
+            st.session_state.cfg_editor_mode, st.session_state.cfg_editor_manual_model, st.session_state.cfg_editor_auto_models_text,
+        )
+        editor_system_prompt_input = st.sidebar.text_area(
+            "Системный промпт — Редактор", value=st.session_state.cfg_editor_system_prompt, height=200, key="editor_prompt_area",
+        )
+        st.sidebar.markdown("---")
+
+        sound_enabled_input = st.sidebar.checkbox(
+            "🔔 Звук по завершении полного цикла (парсинг → анализ → сценарии)", value=st.session_state.cfg_sound_enabled,
+        )
+        st.sidebar.markdown("---")
+
         st.sidebar.markdown("### <i class='fa-solid fa-video'></i> Сбор роликов", unsafe_allow_html=True)
         data_source_labels = {"apify": "🤖 Автоматически через Apify", "manual": "✍️ Вручную (таблица)"}
         data_source_input = st.sidebar.selectbox("Источник данных", list(data_source_labels.keys()), index=list(data_source_labels.keys()).index(st.session_state.cfg_data_source_mode), format_func=lambda k: data_source_labels[k])
@@ -2423,6 +2664,14 @@ else:
             st.session_state.cfg_scriptwriter_auto_models_text = scriptwriter_auto_models_text_input
             st.session_state.cfg_scriptwriter_system_prompt = scriptwriter_system_prompt_input
 
+            st.session_state.cfg_editor_mode = editor_mode_input
+            st.session_state.cfg_editor_manual_model = editor_manual_model_input
+            st.session_state.cfg_editor_auto_models_text = editor_auto_models_text_input
+            st.session_state.cfg_editor_system_prompt = editor_system_prompt_input
+            st.session_state.cfg_qc_enabled = qc_enabled_input
+            st.session_state.cfg_qc_max_revisions = qc_max_revisions_input
+            st.session_state.cfg_sound_enabled = sound_enabled_input
+
             st.session_state.cfg_data_source_mode = data_source_input
             st.session_state.cfg_apify_token = apify_token_input
             st.session_state.cfg_apify_actor = apify_actor_input
@@ -2451,6 +2700,14 @@ else:
             set_setting("cfg_scriptwriter_auto_models_text", scriptwriter_auto_models_text_input)
             set_setting("cfg_scriptwriter_system_prompt", scriptwriter_system_prompt_input)
 
+            set_setting("cfg_editor_mode", editor_mode_input)
+            set_setting("cfg_editor_manual_model", editor_manual_model_input)
+            set_setting("cfg_editor_auto_models_text", editor_auto_models_text_input)
+            set_setting("cfg_editor_system_prompt", editor_system_prompt_input)
+            set_setting("cfg_qc_enabled", str(qc_enabled_input))
+            set_setting("cfg_qc_max_revisions", str(qc_max_revisions_input))
+            set_setting("cfg_sound_enabled", str(sound_enabled_input))
+
             set_setting("cfg_data_source_mode", data_source_input)
             set_setting("cfg_apify_token", apify_token_input)
             set_setting("cfg_apify_actor", apify_actor_input)
@@ -2469,8 +2726,10 @@ else:
         st.sidebar.info("🔒 Настройки может менять только Администратор.")
         analyst_mode_disp = "авто-подбор" if st.session_state.cfg_analyst_mode == "auto" else f"`{st.session_state.cfg_analyst_manual_model}`"
         scriptwriter_mode_disp = "авто-подбор" if st.session_state.cfg_scriptwriter_mode == "auto" else f"`{st.session_state.cfg_scriptwriter_manual_model}`"
+        editor_mode_disp = "авто-подбор" if st.session_state.cfg_editor_mode == "auto" else f"`{st.session_state.cfg_editor_manual_model}`"
         st.sidebar.markdown(f"🧠 **Аналитик:** {analyst_mode_disp}")
         st.sidebar.markdown(f"✍️ **Сценарист:** {scriptwriter_mode_disp}")
+        st.sidebar.markdown(f"🕵️ **Редактор:** {editor_mode_disp} · QC {'включён' if st.session_state.cfg_qc_enabled else 'выключен'}")
         st.sidebar.markdown(f"📥 **Источник данных:** {'Apify (авто)' if st.session_state.cfg_data_source_mode == 'apify' else 'Вручную'}")
         st.sidebar.markdown(f"📏 **Мин. роликов:** {st.session_state.min_reels_required}")
         st.sidebar.markdown(f"🧩 **Сценариев за раз:** {st.session_state.scenarios_count}")
@@ -2490,6 +2749,14 @@ else:
     active_scriptwriter_manual_model = st.session_state.cfg_scriptwriter_manual_model
     active_scriptwriter_auto_models = parse_model_list(st.session_state.cfg_scriptwriter_auto_models_text)
     active_scriptwriter_system_prompt = st.session_state.cfg_scriptwriter_system_prompt
+
+    active_editor_mode = st.session_state.cfg_editor_mode
+    active_editor_manual_model = st.session_state.cfg_editor_manual_model
+    active_editor_auto_models = parse_model_list(st.session_state.cfg_editor_auto_models_text)
+    active_editor_system_prompt = st.session_state.cfg_editor_system_prompt
+    active_qc_enabled = st.session_state.cfg_qc_enabled
+    active_qc_max_revisions = st.session_state.cfg_qc_max_revisions
+    active_sound_enabled = st.session_state.cfg_sound_enabled
 
     active_min_reels = st.session_state.min_reels_required
     active_scenarios_count = st.session_state.scenarios_count
@@ -2789,14 +3056,50 @@ else:
 
     with tab_new:
         st.markdown('<div class="fade-in-container">', unsafe_allow_html=True)
-        blogger_url = st.text_input("Ссылка на профиль блогера (Instagram)", placeholder="https://www.instagram.com/example_blogger/")
-        product_brief = st.text_area("Бриф о товаре для адаптации в сценарий", value=st.session_state.product_brief_default, height=120)
+
+        locked = st.session_state.get("last_analysis") is not None
+        session_nonce = st.session_state.get("session_nonce", 0)
+
+        if locked:
+            la_preview = st.session_state["last_analysis"]
+            lock_col1, lock_col2 = st.columns([4, 1.4])
+            with lock_col1:
+                st.markdown(
+                    f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-lock"></i> "
+                    Сессия занята анализом блогера <b>@{html.escape(extract_instagram_username(la_preview.get('blogger_url', '')))}</b>. "
+                    Чтобы проанализировать другого блогера с чистого листа, нажмите «Новая сессия» — все "
+                    "данные текущего блогера будут сброшены.</div>""",
+                    unsafe_allow_html=True,
+                )
+            with lock_col2:
+                if st.button("🆕 Новая сессия", use_container_width=True, type="primary", key="new_session_btn"):
+                    st.session_state.pop("last_analysis", None)
+                    st.session_state.reels_data = pd.DataFrame(
+                        [{"Ссылка на ролик": "", "Просмотры": 0, "Лайки": 0, "Комментарии": 0,
+                          "Сохранения": 0, "Дата публикации": "", "Время публикации (МСК)": "",
+                          "Что происходит в ролике (кратко)": "", "Транскрипция (если есть)": ""} for _ in range(6)]
+                    )
+                    st.session_state["session_nonce"] = session_nonce + 1
+                    for stale_key in ("reels_editor_widget",):
+                        if stale_key in st.session_state:
+                            del st.session_state[stale_key]
+                    st.rerun()
+
+        blogger_url = st.text_input(
+            "Ссылка на профиль блогера (Instagram)", placeholder="https://www.instagram.com/example_blogger/",
+            disabled=locked, key=f"blogger_url_input_{session_nonce}",
+        )
+        product_brief = st.text_area(
+            "Бриф о товаре для адаптации в сценарий", value=st.session_state.product_brief_default, height=120,
+            disabled=locked, key=f"product_brief_input_{session_nonce}",
+        )
 
         edited_df = None
         if active_data_source_mode == "manual":
             st.markdown("**Ролики блогера** — заполните вручную:")
             edited_df = st.data_editor(
-                st.session_state.reels_data, num_rows="dynamic", use_container_width=True, key="reels_editor_widget",
+                st.session_state.reels_data, num_rows="dynamic", use_container_width=True,
+                key=f"reels_editor_widget_{session_nonce}", disabled=locked,
                 column_config={
                     "Просмотры": st.column_config.NumberColumn(min_value=0, step=100),
                     "Лайки": st.column_config.NumberColumn(min_value=0, step=10),
@@ -2812,13 +3115,14 @@ else:
             )
 
         btn_col1, btn_col2 = st.columns(2)
-        with btn_col1: submit_btn = st.button("🚀 Проанализировать ролики", use_container_width=True)
-        with btn_col2: test_btn = st.button("🧪 Заполнить тестовыми роликами", use_container_width=True) if active_data_source_mode == "manual" else False
+        with btn_col1: submit_btn = st.button("🚀 Проанализировать ролики", use_container_width=True, disabled=locked)
+        with btn_col2: test_btn = (st.button("🧪 Заполнить тестовыми роликами", use_container_width=True, disabled=locked) if active_data_source_mode == "manual" else False)
         st.markdown('</div>', unsafe_allow_html=True)
 
         if test_btn:
             st.session_state.reels_data = build_test_dataframe()
-            if "reels_editor_widget" in st.session_state: del st.session_state["reels_editor_widget"]
+            stale_key = f"reels_editor_widget_{session_nonce}"
+            if stale_key in st.session_state: del st.session_state[stale_key]
             st.rerun()
 
         if submit_btn:
@@ -2911,6 +3215,25 @@ else:
                                         except Exception as exc:
                                             st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Не удалось получить транскрипцию для {len(missing_links)} ролика(ов) ({type(exc).__name__}: {exc}). Эти ролики пойдут без текста речи.</div>""", unsafe_allow_html=True)
 
+                        # --- Черновое сохранение сырых данных Apify СРАЗУ после парсинга, ДО вызова ИИ. ---
+                        # Так лимиты API-ключа Apify не тратятся впустую: даже если аналитик/сценарист
+                        # полностью откажут (лимиты моделей, сеть и т.д.), собранные ролики и транскрипции
+                        # уже в базе — при повторной попытке для этого блогера повторный парсинг не нужен.
+                        # Ниже эта же запись дозаполняется результатом ИИ через update_analysis_result.
+                        draft_saved_id = save_analysis(
+                            manager=selected_manager, blogger_url=blogger_url,
+                            blogger_handle=extract_instagram_username(blogger_url),
+                            data_source=active_data_source_mode, model_used_analyst=None, model_used_scenarist=None,
+                            reels_count=valid_count, median_views=median_views,
+                            viral_count=len(top_viral_df) if threshold_met else 0,
+                            product_brief=product_brief, metrics_df=metrics_df, top_viral_df=top_viral_df,
+                            result={"audience_summary": "", "patterns": [], "scenarios": [], "verdict_note": ""},
+                        )
+                        if draft_saved_id:
+                            st.caption(f"💾 Собранные данные ролика сохранены в базу (запись №{draft_saved_id}) — при сбое ИИ повторный парсинг через Apify не понадобится.")
+                        else:
+                            st.caption("⚠️ Не удалось сохранить сырые данные ролика в базу перед анализом ИИ.")
+
                         # Считаем сводную статистику по залётности заранее — она передаётся обеим ролям ИИ,
                         # без неё прогноз охвата/ER и вероятность залёта считались бы «в вакууме».
                         viral_stats = compute_viral_summary_stats(metrics_df, active_viral_threshold)
@@ -2958,6 +3281,26 @@ else:
                         }
                         result = backfill_missing_media_data(result, metrics_df, top_viral_df, viral_stats)
 
+                        # --- Шаг 3: Редактор проверяет каждый сценарий (гейт fit_score="высокий" + уникальность),
+                        # при отказе — Сценарист переписывает конкретный сценарий по замечаниям, в пределах лимита. ---
+                        qc_log_initial = []
+                        if active_qc_enabled and result.get("scenarios") and analyst_model_used and scriptwriter_model_used:
+                            with st.spinner("🕵️ ИИ-редактор проверяет сценарии на fit и уникальность..."):
+                                result["scenarios"], qc_log_initial = run_scenario_qc_pass(
+                                    result.get("scenarios", []), result.get("patterns", []), blogger_url, product_brief,
+                                    metrics_df, median_views, top_viral_df, viral_stats,
+                                    active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
+                                    active_editor_mode, active_editor_manual_model, active_editor_auto_models,
+                                    active_max_tokens, active_editor_system_prompt,
+                                    active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
+                                    active_max_tokens, active_scriptwriter_system_prompt,
+                                    max_revisions=active_qc_max_revisions,
+                                )
+                                result = backfill_missing_media_data(result, metrics_df, top_viral_df, viral_stats)
+                        if qc_log_initial:
+                            with st.expander("🔍 Ход проверки качества сценариев (редактор)"):
+                                for line in qc_log_initial: st.code(line, language="text")
+
                         # Сохраняем последний результат анализа в сессии (включая бриф и данные роликов),
                         # чтобы кнопки «Обновить сценарии» и «Выгрузить» ниже могли им пользоваться даже
                         # после перезапуска скрипта при клике на сами кнопки.
@@ -2975,7 +3318,16 @@ else:
                             "saved_id": None,
                         }
 
-                        if result.get("scenarios") and analyst_model_used:
+                        # --- Финализация записи: если черновое сохранение сырых данных прошло успешно,
+                        # дозаполняем ЕЁ ЖЕ результатом ИИ (не плодим дубликат) — так запись в истории есть
+                        # ВСЕГДА, даже если ИИ полностью отказал (тогда result_json останется черновым). ---
+                        if draft_saved_id:
+                            finalize_ok = update_analysis_result(
+                                draft_saved_id, result, viral_count=len(top_viral_df) if threshold_met else 0,
+                                model_used_analyst=analyst_model_used, model_used_scenarist=scriptwriter_model_used,
+                            )
+                            saved_id = draft_saved_id if finalize_ok else None
+                        elif result.get("scenarios") and analyst_model_used:
                             saved_id = save_analysis(
                                 manager=selected_manager, blogger_url=blogger_url, blogger_handle=extract_instagram_username(blogger_url),
                                 data_source=active_data_source_mode, model_used_analyst=analyst_model_used,
@@ -2983,12 +3335,19 @@ else:
                                 median_views=median_views, viral_count=len(top_viral_df) if threshold_met else 0,
                                 product_brief=product_brief, metrics_df=metrics_df, top_viral_df=top_viral_df, result=result,
                             )
-                            if saved_id:
-                                st.session_state["last_analysis"]["saved_id"] = saved_id
-                                st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
-                            else: st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
                         else:
-                            st.caption("Результат не сохранён в историю: ИИ не вернул готовых паттернов/сценариев.")
+                            saved_id = None
+
+                        st.session_state["last_analysis"]["saved_id"] = saved_id
+
+                        if saved_id and analyst_model_used and result.get("scenarios"):
+                            st.success(f"✅ Анализ сохранён в вашу историю (запись №{saved_id}) — смотрите на вкладке «Мои блогеры».")
+                            if active_sound_enabled:
+                                play_completion_sound()
+                        elif saved_id:
+                            st.warning(f"⚠️ Сырые данные ролика сохранены в историю (запись №{saved_id}), но ИИ не смог полностью завершить анализ — повторный парсинг через Apify для этого блогера больше не понадобится.")
+                        else:
+                            st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
 
         # --- Единый блок отображения последнего анализа: рендер результата + кнопки
         # «Обновить сценарии» (переписать все сразу силами Сценариста — без повторного анализа паттернов
@@ -2997,6 +3356,8 @@ else:
         # Работает и сразу после генерации, и после обновления (через session_state). ---
         if st.session_state.get("last_analysis"):
             la = st.session_state["last_analysis"]
+            if st.session_state.pop("_pending_completion_sound", False):
+                play_completion_sound()
             clicked_scenario_idx = render_full_result(
                 la["metrics_df"], la["top_viral_df"], la["result"],
                 enable_scenario_regen=True, regen_key_prefix="persist",
@@ -3042,6 +3403,25 @@ else:
                         updated_scenarios.append(new_scenarios_list[0])
                     la["result"]["scenarios"] = updated_scenarios
                     la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
+
+                    qc_log_single = []
+                    if active_qc_enabled:
+                        with st.spinner("🕵️ ИИ-редактор проверяет обновлённый сценарий..."):
+                            la["result"]["scenarios"], qc_log_single = run_scenario_qc_pass(
+                                la["result"].get("scenarios", []), current_patterns, la["blogger_url"], la["product_brief"],
+                                la["metrics_df"], la["median_views"], la["top_viral_df"], la.get("viral_stats"),
+                                active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
+                                active_editor_mode, active_editor_manual_model, active_editor_auto_models,
+                                active_max_tokens, active_editor_system_prompt,
+                                active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
+                                active_max_tokens, active_scriptwriter_system_prompt,
+                                max_revisions=active_qc_max_revisions, only_indices={clicked_scenario_idx},
+                            )
+                            la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
+                    if qc_log_single:
+                        with st.expander(f"🔍 Ход проверки качества (редактор) — сценарий №{clicked_scenario_idx + 1}"):
+                            for line in qc_log_single: st.code(line, language="text")
+
                     la["model_used_scenarist"] = single_model_used
                     la["created"] = datetime.now().strftime("%d.%m.%Y %H:%M")
                     st.session_state["last_analysis"] = la
@@ -3077,6 +3457,25 @@ else:
                 if new_scenarios and refresh_model_used:
                     la["result"]["scenarios"] = new_scenarios
                     la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
+
+                    qc_log_refresh = []
+                    if active_qc_enabled:
+                        with st.spinner("🕵️ ИИ-редактор проверяет новые сценарии на fit и уникальность..."):
+                            la["result"]["scenarios"], qc_log_refresh = run_scenario_qc_pass(
+                                la["result"].get("scenarios", []), current_patterns, la["blogger_url"], la["product_brief"],
+                                la["metrics_df"], la["median_views"], la["top_viral_df"], la.get("viral_stats"),
+                                active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
+                                active_editor_mode, active_editor_manual_model, active_editor_auto_models,
+                                active_max_tokens, active_editor_system_prompt,
+                                active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
+                                active_max_tokens, active_scriptwriter_system_prompt,
+                                max_revisions=active_qc_max_revisions,
+                            )
+                            la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
+                    if qc_log_refresh:
+                        with st.expander("🔍 Ход проверки качества сценариев (редактор)"):
+                            for line in qc_log_refresh: st.code(line, language="text")
+
                     la["model_used_scenarist"] = refresh_model_used
                     la["created"] = datetime.now().strftime("%d.%m.%Y %H:%M")
                     st.session_state["last_analysis"] = la
@@ -3088,6 +3487,10 @@ else:
                             st.warning("Сценарии обновлены, но не удалось обновить запись в истории.")
                     else:
                         st.success(f"✅ Сценарии обновлены (модель: {refresh_model_used}).")
+                    if active_sound_enabled:
+                        # Звук ставим в очередь и проигрываем уже ПОСЛЕ rerun (в блоке рендера ниже) —
+                        # иначе браузер не успевает создать AudioContext до немедленной перерисовки страницы.
+                        st.session_state["_pending_completion_sound"] = True
                     st.rerun()
                 else:
                     st.error("Не удалось получить новые сценарии от ИИ-сценариста — прежний результат оставлен без изменений.")
