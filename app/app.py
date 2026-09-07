@@ -1000,11 +1000,20 @@ DEFAULT_EDITOR_SYSTEM_PROMPT = """Ты — Редактор и контролё�
 КРИТЕРИИ ПРОВЕРКИ
 ═══════════════════════════════════
 1. FIT. Поле fit_score должно быть "высокий". Если в сценарии стоит "средний" или "низкий", но при этом anchor_url заполнен (то есть реальный подходящий ролик-донор есть) — это ВСЕГДА повод для verdict="revise": цель — выжать максимум потенциала блогера, компромиссные сценарии не отправляются менеджеру. Единственное исключение: если сценарий по сути является честным отказом ("подходящего материала у этого блогера нет") — тогда его fit специально низкий и это НЕ повод для revise, отправляй verdict="pass".
-2. ПРИВЯЗКА К АНАТОМИИ ПАТТЕРНА. Хук и сценарий должны держаться на конкретных деталях из evidence паттерна (структура хука, темп, визуальный приём, лексика блогера). Если сценарий можно один в один вставить под любой другой товар или любого другого блогера без потери смысла — это провал уникальности, verdict="revise".
-3. ЖИВОЙ, НЕ-ИИ ТЕКСТ. Проверяй hook, script и caption на признаки шаблонного ИИ-текста: канцелярские обороты («играет ключевую роль», «в современном мире», «важно отметить»), тройные перечисления («быстро, стильно, удобно»), тире как разделитель посреди фразы, дежурные оптимистичные концовки, рекламные клише («это не просто майка, это...», «идеальное решение»). Если такое есть — verdict="revise" с конкретным указанием, что переписать.
+2. ПРИВЯЗКА К АНАТОМИИ ПАТТЕРНА БЛОГЕРА (адаптация, а не «уникальность текста» — за неё отвечает следующий пункт). Хук и сценарий должны держаться на конкретных деталях из evidence паттерна (структура хука, темп, визуальный приём, конкретная лексика именно этого блогера). Если сценарий можно один в один вставить под любой другой товар или любого другого блогера без потери смысла — это провал адаптации, verdict="revise".
+3. ОЧЕЛОВЕЧИВАНИЕ — КЛЮЧЕВОЙ КРИТЕРИЙ. Здесь ты проверяешь не текстовую уникальность (см. п.2), а одно: звучит ли hook/script/caption так, будто их написал живой человек на камеру, а не языковая модель. Мысленно прочитай текст вслух и сверься со списком конкретных признаков ИИ-текста — verdict="revise", если нашёл ХОТЯ БЫ ДВА признака из списка:
+   а) Канцелярит и «умные» книжные обороты не в духе устной речи: «играет ключевую роль», «в современном мире», «важно отметить», «представляет собой», «является отличным решением», «неотъемлемая часть». Живой человек на камеру так не говорит.
+   б) Рекламные клише и немотивированные превосходные степени: «это не просто майка, это...», «идеальное решение», «мастхэв», «взрывной эффект», «потрясающий/невероятный/уникальный» там, где рядом нет ни одной конкретной детали, объясняющей почему.
+   в) Искусственная тройка эпитетов подряд без конкретики («быстро, стильно, удобно», «легко, комфортно, элегантно») — почти всегда ИИ-паттерн, живая речь так не считает по пальцам.
+   г) Конструкция «не просто X, а Y» / «это не X, это Y» использована больше одного раза за сценарий — верный признак шаблона.
+   д) Тире (—) как псевдо-художественный разделитель посреди реплики или caption, там, где живой человек в спонтанной речи поставил бы точку, запятую или вообще не сделал бы паузы.
+   е) Общая бодрая ничего-не-значащая концовка («это меняет всё», «результат не заставит себя ждать», «а теперь пришло время сиять») вместо конкретной последней детали — реплики, действия в кадре или мысли по существу.
+   ж) Слишком ровный, гладкий ритм фраз без единой живой заминки — в spontaneous-речи блогеров обычно есть обрывки мыслей, самоперебивы, разговорные частицы («ну», «типа», «короче»); если судя по evidence паттерна у этого блогера такая манера речи, а в сценарии её нет вообще — текст звучит переведённым, а не сказанным.
+   з) Лексика и интонация обобщённо-«блогерские», а не голос ИМЕННО этого блогера из evidence — даже формально гладкий и «живой» текст, который не пытается звучать как конкретно этот человек, тоже не проходит.
+   Если verdict="revise" по этому пункту — revision_notes должны называть КОНКРЕТНУЮ фразу для замены и в каком духе её переписать (не «сделай живее», а, например: «замени ‘это не просто майка, это стиль’ на прямую реплику в духе блогера — см. как он говорит в evidence: ...»).
 4. ЛЕГАЛЬНОСТЬ. Поле ad_marking_note должно содержать реальную инструкцию по маркировке рекламы, а не быть пустым или формальной отпиской.
 5. РЕАЛИСТИЧНОСТЬ ОБРАЗА. Товар — утягивающая БАЗОВАЯ майка: в реальной жизни её носят либо самостоятельным топом, либо невидимым под-слоем ПОД обычной одеждой (расстёгнутая рубашка, кардиган, жакет, платье-сарафан). Внимательно прочитай script и hook: если персонаж надевает товар поверх/под ДРУГУЮ утягивающую или компрессионную вещь (боди, корсет, бельё-утяжку, другой шейпер), либо в сценарии в принципе описана вещевая комбинация, которую реальный человек так не носит и не сочетает — это грубая логическая ошибка, а не мелочь. Даже при высоком fit_score и живом тексте такой сценарий получает verdict="revise" с конкретным указанием, какую комбинацию одежды заменить на жизненную.
-6. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный, нативный и вещи в кадре сочетаются реалистично — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые или нелепые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет и лимиты API).
+6. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный, нативный, звучит как живой человек и вещи в кадре сочетаются реалистично — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые, ИИ-шаблонные или нелепые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет, лимиты API и время — на каждый лишний круг доработки уходит отдельный вызов и Редактора, и Сценариста).
 
 Если verdict="revise" — поле revision_notes должно быть конкретной инструкцией для сценариста: что именно усилить или переписать (не общие слова вроде «сделай лучше», а конкретика: «хук не привязан к анатомии паттерна — используй деталь из evidence про смену кадра на 0.5 секунде», «fit средний из-за того что товар вставлен поверх сценария, а не внутрь — переставь появление майки в момент смены образа, как в оригинале»).
 
@@ -1074,6 +1083,7 @@ if "settings_loaded" not in st.session_state:
     st.session_state.cfg_ai_base_url = load_setting_str("cfg_ai_base_url", "https://openrouter.ai/api/v1")
     st.session_state.cfg_ai_key = load_setting_str("cfg_ai_key", "")
     st.session_state.cfg_max_tokens = load_setting_int("cfg_max_tokens", 3000)
+    st.session_state.cfg_editor_max_tokens = load_setting_int("cfg_editor_max_tokens", 700)
 
     # --- Роль «Аналитик» ---
     st.session_state.cfg_analyst_mode = load_setting_str("cfg_analyst_mode", "auto")
@@ -1210,13 +1220,31 @@ def call_chat_completion(client, model, messages, max_tokens, provider_mode):
             if "reasoning" in msg or "thinking" in msg or "400" in msg:
                 return client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages)
             raise
+    if provider_mode == "openrouter":
+        # Многие бесплатные модели на OpenRouter — «think»-модели: перед ответом они генерируют
+        # скрытые reasoning-токены, которые не видны в ответе, но занимают время и режут в тот же
+        # max_tokens. На медленном бесплатном тире это легко съедает большую часть тайм-аута ещё ДО
+        # того, как модель начнёт писать сам JSON — реальная причина, по которой обычный анализ мог
+        # растягиваться на много минут. reasoning.effort="none" — единый параметр OpenRouter, отключающий
+        # это для ЛЮБОГО провайдера под капотом (openrouter.ai/docs/use-cases/reasoning-tokens). Если
+        # конкретная модель его не понимает — тихо откатываемся на обычный вызов, не роняя весь запрос.
+        try:
+            return client.chat.completions.create(
+                model=model, max_tokens=max_tokens, messages=messages,
+                extra_body={"reasoning": {"effort": "none"}},
+            )
+        except Exception as exc:
+            msg = str(exc).lower()
+            if "reasoning" in msg or "400" in msg or "unsupported" in msg or "unknown parameter" in msg:
+                return client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages)
+            raise
     return client.chat.completions.create(model=model, max_tokens=max_tokens, messages=messages)
 
 def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
     try:
         if provider_mode == "anthropic_direct":
             if Anthropic is None: return {"score": 0, "detail": "библиотека anthropic не установлена"}
-            client = Anthropic(api_key=api_key)
+            client = Anthropic(api_key=api_key, timeout=timeout, max_retries=0)
             response = client.messages.create(
                 model=model_id, max_tokens=300, system=TEST_SYSTEM_PROMPT,
                 messages=[{"role": "user", "content": TEST_USER_PROMPT}],
@@ -1224,7 +1252,7 @@ def test_single_model(provider_mode, base_url, api_key, model_id, timeout=30):
             raw_text = "".join(b.text for b in response.content if getattr(b, "type", None) == "text")
         else:
             if OpenAI is None: return {"score": 0, "detail": "библиотека openai не установлена"}
-            client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout)
+            client = OpenAI(base_url=base_url, api_key=api_key, timeout=timeout, max_retries=0)
             response = call_chat_completion(
                 client, model_id,
                 messages=[{"role": "system", "content": TEST_SYSTEM_PROMPT}, {"role": "user", "content": TEST_USER_PROMPT}],
@@ -1289,17 +1317,33 @@ def mark_model_cooldown(model_id: str, seconds: int = 600):
     cooldowns[model_id] = time.time() + seconds
 
 
+# Тайм-аут на ОДНУ попытку вызова одной модели. Раньше он не был задан явно, из-за чего клиент openai
+# использовал свой дефолт в 600 секунд НА ПОПЫТКУ (и ещё сам ретраил дважды при сбое) — зависшая или
+# перегруженная бесплатная модель могла держать весь цикл анализа многие минуты, прежде чем наш
+# собственный failover (call_role_with_failover) получал шанс переключиться на следующую модель в
+# списке. 90 секунд с запасом хватает даже медленной бесплатной модели на полноценный JSON-ответ
+# (см. также отдельный, гораздо меньший max_tokens у Редактора — cfg_editor_max_tokens), но не даёт
+# одному зависшему вызову съесть львиную долю всего времени анализа.
+AI_CALL_TIMEOUT_SECONDS = 90
+
+
 def _attempt_ai_call(provider_mode, base_url, api_key, model, system_prompt, user_prompt, max_tokens, required_keys):
     """Одна попытка вызова одной модели. Возвращает (parsed_dict_or_None, raw_text_or_None, error_code_or_None)."""
     if provider_mode == "anthropic_direct":
-        client = Anthropic(api_key=api_key)
+        client = Anthropic(api_key=api_key, timeout=AI_CALL_TIMEOUT_SECONDS, max_retries=0)
         response = client.messages.create(
             model=model, max_tokens=max_tokens, system=system_prompt,
             messages=[{"role": "user", "content": user_prompt}],
         )
         raw_text = "".join(block.text for block in response.content if getattr(block, "type", None) == "text")
     else:
-        client = OpenAI(base_url=base_url, api_key=api_key)
+        # ВАЖНО: без явных timeout/max_retries клиент openai по умолчанию ждёт до 600 секунд на попытку
+        # И САМ делает до 2 повторов при сбое — то есть одна «зависшая» бесплатная модель могла держать
+        # весь цикл до ~30 минут, прежде чем наш собственный failover вообще получал шанс переключиться
+        # на следующую модель. Это была главная причина, по которой обычный анализ растягивался с
+        # 1.5 минут до 7-10: наш failover-цикл (call_role_with_failover) уже сам переключает модели при
+        # сбое, поэтому внутренний retry клиента только дублирует эту работу и не нужен.
+        client = OpenAI(base_url=base_url, api_key=api_key, timeout=AI_CALL_TIMEOUT_SECONDS, max_retries=0)
         response = call_chat_completion(
             client, model,
             messages=[{"role": "system", "content": system_prompt}, {"role": "user", "content": user_prompt}],
@@ -2960,6 +3004,13 @@ else:
             value=st.session_state.cfg_qc_max_revisions, step=1,
             help="0 — редактор только помечает слабые сценарии, но не запускает переписывание.",
         )
+        editor_max_tokens_input = st.sidebar.number_input(
+            "Лимит токенов ответа Редактора (max_tokens)", min_value=200, max_value=2000,
+            value=st.session_state.cfg_editor_max_tokens, step=50,
+            help="Редактор отвечает коротким JSON (verdict/reason/revision_notes), а не сценарием целиком — "
+                 "отдельный, маленький лимит от общего (см. выше) заметно ускоряет проверку, особенно когда "
+                 "она идёт по несколько раз подряд (по одному вызову на каждый сценарий).",
+        )
         editor_mode_input, editor_manual_model_input, editor_auto_models_text_input = render_role_model_settings(
             "editor", "🕵️ Редактор", provider_mode_input,
             st.session_state.cfg_editor_mode, st.session_state.cfg_editor_manual_model, st.session_state.cfg_editor_auto_models_text,
@@ -3035,6 +3086,7 @@ else:
             st.session_state.cfg_editor_system_prompt = editor_system_prompt_input
             st.session_state.cfg_qc_enabled = qc_enabled_input
             st.session_state.cfg_qc_max_revisions = qc_max_revisions_input
+            st.session_state.cfg_editor_max_tokens = editor_max_tokens_input
             st.session_state.cfg_sound_enabled = sound_enabled_input
 
             st.session_state.cfg_data_source_mode = data_source_input
@@ -3070,6 +3122,7 @@ else:
             set_setting("cfg_editor_system_prompt", editor_system_prompt_input)
             set_setting("cfg_qc_enabled", str(qc_enabled_input))
             set_setting("cfg_qc_max_revisions", str(qc_max_revisions_input))
+            set_setting("cfg_editor_max_tokens", str(editor_max_tokens_input))
             set_setting("cfg_sound_enabled", str(sound_enabled_input))
 
             set_setting("cfg_data_source_mode", data_source_input)
@@ -3102,6 +3155,13 @@ else:
     active_provider_mode = st.session_state.cfg_ai_provider_mode
     active_base_url = st.session_state.cfg_ai_base_url
     active_max_tokens = st.session_state.cfg_max_tokens
+    # У Редактора отдельный, гораздо меньший лимит токенов: он всегда отвечает крошечным JSON
+    # {verdict, reason, revision_notes}, а не полноценным сценарием. Если гонять его на общем лимите
+    # в 3000 токенов, «думающая» бесплатная модель может генерировать/обрезаться заметно дольше, чем
+    # реально нужно для ответа — а Редактор вызывается ПО РАЗУ НА КАЖДЫЙ сценарий, так что эта разница
+    # умножается на количество сценариев и была одной из причин, почему полный цикл растягивался
+    # на 7-10 минут вместо 1.5.
+    active_editor_max_tokens = st.session_state.cfg_editor_max_tokens
 
     active_analyst_mode = st.session_state.cfg_analyst_mode
     active_analyst_manual_model = st.session_state.cfg_analyst_manual_model
@@ -3537,11 +3597,27 @@ else:
     with tab_new:
         st.markdown('<div class="fade-in-container">', unsafe_allow_html=True)
 
-        locked = st.session_state.get("last_analysis") is not None
+        # "locked" держит поля формы (ссылка, бриф, ролики, кнопка) неактивными не только ПОСЛЕ готового
+        # анализа, но и ВО ВРЕМЯ его выполнения (analysis_running) — без этого пользователь видит старый,
+        # ещё не заблокированный кадр страницы все 1-10 минут обработки: Streamlit не присылает браузеру
+        # обновлённое состояние виджетов, пока текущий прогон скрипта не закончится, поэтому блокировку
+        # нужно зафиксировать в session_state и сразу перерисовать страницу (st.rerun()) ДО тяжёлой работы.
+        locked = st.session_state.get("last_analysis") is not None or st.session_state.get("analysis_running", False)
         session_nonce = st.session_state.get("session_nonce", 0)
 
-        if locked:
-            la_preview = st.session_state["last_analysis"]
+        la_preview = st.session_state.get("last_analysis")
+        analysis_in_flight = st.session_state.get("analysis_running", False)
+        if analysis_in_flight and la_preview is None:
+            # Анализ уже запущен (флаг выставлен и страница перерисована), но результата ещё нет —
+            # это самый первый кадр, который видит пользователь сразу после клика «Проанализировать
+            # ролики». Сброс сессии здесь бессмысленен (сбрасывать ещё нечего) — просто показываем,
+            # что форма занята, без кнопки «Новая сессия».
+            st.markdown(
+                """<div class="custom-warning fade-in-container"><i class="fa-solid fa-spinner fa-spin"></i> """
+                """Идёт анализ — поля формы временно недоступны, дождитесь завершения ниже.</div>""",
+                unsafe_allow_html=True,
+            )
+        elif locked and la_preview is not None:
             lock_col1, lock_col2 = st.columns([4, 1.4])
             with lock_col1:
                 st.markdown(
@@ -3554,6 +3630,7 @@ else:
             with lock_col2:
                 if st.button("🆕 Новая сессия", use_container_width=True, type="primary", key="new_session_btn"):
                     st.session_state.pop("last_analysis", None)
+                    st.session_state["analysis_running"] = False
                     st.session_state.reels_data = pd.DataFrame(
                         [{"Ссылка на ролик": "", "Просмотры": 0, "Лайки": 0, "Комментарии": 0,
                           "Сохранения": 0, "Дата публикации": "", "Время публикации (МСК)": "",
@@ -3608,6 +3685,18 @@ else:
         if submit_btn:
             if not blogger_url.strip():
                 st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation" style="font-size: 20px;"></i> Укажите ссылку на блогера.</div>""", unsafe_allow_html=True)
+            else:
+                # Сначала фиксируем «анализ идёт» и перерисовываем страницу — поле и кнопка сразу
+                # становятся неактивными (см. locked выше), а не только после того как анализ уже закончится.
+                st.session_state["analysis_running"] = True
+                st.rerun()
+
+        if st.session_state.get("analysis_running", False):
+            if not blogger_url.strip():
+                # Защита от гонки состояний (например session_nonce успел смениться) — не оставляем
+                # форму навечно заблокированной без реального анализа в процессе.
+                st.session_state["analysis_running"] = False
+                st.rerun()
             else:
                 apify_debug_raw = None
                 apify_debug_error = None
@@ -3784,7 +3873,7 @@ else:
                                     metrics_df, median_views, top_viral_df, viral_stats,
                                     active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
                                     active_editor_mode, active_editor_manual_model, active_editor_auto_models,
-                                    active_max_tokens, active_editor_system_prompt,
+                                    active_editor_max_tokens, active_editor_system_prompt,
                                     active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                     active_max_tokens, active_scriptwriter_system_prompt,
                                     max_revisions=active_qc_max_revisions,
@@ -3841,6 +3930,14 @@ else:
                             st.warning(f"⚠️ Сырые данные ролика сохранены в историю (запись №{saved_id}), но ИИ не смог полностью завершить анализ — повторный парсинг через Apify для этого блогера больше не понадобится.")
                         else:
                             st.warning("Не удалось сохранить анализ в историю — результат выше доступен только сейчас.")
+
+                # Анализ (успешный или нет) завершён — снимаем блокировку «идёт обработка» и перерисовываем
+                # страницу с чистого листа: если last_analysis сохранился, здесь сразу же (см. locked выше)
+                # покажутся и заблокированные поля, и кнопка «Новая сессия» — то, чего раньше не было видно
+                # без ручного повторного действия, потому что этот кусок страницы уже отрисовался ДО того,
+                # как last_analysis появился в session_state в этом же прогоне скрипта.
+                st.session_state["analysis_running"] = False
+                st.rerun()
 
         # --- Единый блок отображения последнего анализа: рендер результата + кнопки
         # «Обновить сценарии» (переписать все сразу силами Сценариста — без повторного анализа паттернов
@@ -3905,7 +4002,7 @@ else:
                                 la["metrics_df"], la["median_views"], la["top_viral_df"], la.get("viral_stats"),
                                 active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
                                 active_editor_mode, active_editor_manual_model, active_editor_auto_models,
-                                active_max_tokens, active_editor_system_prompt,
+                                active_editor_max_tokens, active_editor_system_prompt,
                                 active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                 active_max_tokens, active_scriptwriter_system_prompt,
                                 max_revisions=active_qc_max_revisions, only_indices={clicked_scenario_idx},
@@ -3959,7 +4056,7 @@ else:
                                 la["metrics_df"], la["median_views"], la["top_viral_df"], la.get("viral_stats"),
                                 active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
                                 active_editor_mode, active_editor_manual_model, active_editor_auto_models,
-                                active_max_tokens, active_editor_system_prompt,
+                                active_editor_max_tokens, active_editor_system_prompt,
                                 active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                 active_max_tokens, active_scriptwriter_system_prompt,
                                 max_revisions=active_qc_max_revisions,
