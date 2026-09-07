@@ -471,6 +471,33 @@ def init_db():
                 value TEXT
             )
         """)
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS apify_keys (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                token TEXT NOT NULL UNIQUE,
+                label TEXT,
+                date_added TEXT NOT NULL,
+                status TEXT NOT NULL DEFAULT 'unknown',
+                usage_pct REAL,
+                usage_detail TEXT,
+                cycle_reset_at TEXT,
+                last_checked_at TEXT
+            )
+        """)
+        # Миграция: если в старых версиях уже был задан единственный cfg_apify_token в app_settings,
+        # но таблица apify_keys ещё пуста — переносим его туда одной записью, чтобы при обновлении
+        # приложения ключ не потерялся и пул ключей не оказался пустым.
+        try:
+            legacy_row = conn.execute("SELECT value FROM app_settings WHERE key = 'cfg_apify_token'").fetchone()
+            legacy_token = (legacy_row["value"] or "").strip() if legacy_row else ""
+            keys_count = conn.execute("SELECT COUNT(*) AS c FROM apify_keys").fetchone()["c"]
+            if legacy_token and keys_count == 0:
+                conn.execute(
+                    "INSERT OR IGNORE INTO apify_keys (token, label, date_added, status) VALUES (?, ?, ?, 'unknown')",
+                    (legacy_token, "перенесён автоматически из старых настроек", datetime.now().isoformat(timespec="seconds")),
+                )
+        except Exception:
+            pass
         existing = conn.execute("SELECT COUNT(*) AS c FROM managers").fetchone()["c"]
         if existing == 0:
             seed = [
@@ -571,6 +598,74 @@ def count_manager_analyses(name):
             return conn.execute("SELECT COUNT(*) AS c FROM analyses WHERE manager = ?", (name,)).fetchone()["c"]
     except Exception:
         return 0
+
+
+# ============================================================================
+# ПУЛ КЛЮЧЕЙ APIFY: неограниченное число API-токенов, статус лимитов и автопереключение
+# ============================================================================
+# Лимиты Apify считаются на уровне АККАУНТА (а не отдельного токена) и сбрасываются не по
+# фиксированной календарной дате и не через N дней после исчерпания, а по собственному
+# ежемесячному биллинг-циклу аккаунта (см. официальный ответ users/me/limits — поле
+# monthlyUsageCycle.startAt/endAt). Поэтому вместо того чтобы самим высчитывать «когда лимит
+# освободится» по дате добавления ключа, мы прямо спрашиваем это у Apify (check_apify_key_live)
+# и сохраняем последний известный статус — так дата сброса всегда точная, а не предположение.
+def add_apify_key(token, label=None):
+    token = (token or "").strip()
+    if not token:
+        return False, "Ключ не может быть пустым."
+    if len(token) < 10:
+        return False, "Это не похоже на реальный Apify API-токен."
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "INSERT INTO apify_keys (token, label, date_added, status) VALUES (?, ?, ?, 'unknown')",
+                (token, (label or "").strip() or None, datetime.now().isoformat(timespec="seconds")),
+            )
+        return True, "Ключ Apify добавлен."
+    except sqlite3.IntegrityError:
+        return False, "Такой ключ уже есть в списке."
+    except Exception as exc:
+        return False, f"Ошибка: {exc}"
+
+def get_apify_keys():
+    """Все сохранённые ключи, от старых к новым (порядок добавления — как ориентир пользователю)."""
+    try:
+        with db_connect() as conn:
+            rows = conn.execute("SELECT * FROM apify_keys ORDER BY date_added ASC, id ASC").fetchall()
+            return [dict(r) for r in rows]
+    except Exception:
+        return []
+
+def delete_apify_key(key_id):
+    try:
+        with db_connect() as conn:
+            conn.execute("DELETE FROM apify_keys WHERE id = ?", (key_id,))
+        return True, "Ключ удалён."
+    except Exception as exc:
+        return False, f"Ошибка: {exc}"
+
+def update_apify_key_status(key_id, status, usage_pct=None, usage_detail=None, cycle_reset_at=None):
+    """Записывает результат живой проверки лимитов (check_apify_key_live) — статус, % использования
+    месячного бюджета и дату сброса цикла ПО ДАННЫМ САМОГО APIFY (не наш расчёт)."""
+    try:
+        with db_connect() as conn:
+            conn.execute(
+                "UPDATE apify_keys SET status = ?, usage_pct = ?, usage_detail = ?, cycle_reset_at = ?, "
+                "last_checked_at = ? WHERE id = ?",
+                (status, usage_pct, usage_detail, cycle_reset_at, datetime.now().isoformat(timespec="seconds"), key_id),
+            )
+        return True
+    except Exception:
+        return False
+
+def get_apify_key_pool():
+    """Ключи в порядке предпочтения для реального запроса: сначала «зелёные» (точно есть лимиты),
+    затем «unknown» (ещё не проверялись — оптимистично пробуем), затем «красные» в последнюю очередь
+    (вдруг цикл уже обновился, а мы это ещё не перепроверили). Внутри каждой группы — ключи, которые
+    проверялись/использовались раньше остальных, чтобы нагрузка распределялась по пулу равномерно."""
+    order = {"green": 0, "unknown": 1, "red": 2}
+    keys = get_apify_keys()
+    return sorted(keys, key=lambda k: (order.get(k.get("status"), 1), k.get("last_checked_at") or ""))
 
 def get_setting(key, default=None):
     try:
@@ -818,6 +913,12 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
 — список запрещённых и разрешённых формулировок (тон).
 Если формулировка выгоды в черновике сценария — обобщённая маркетинговая фраза, а не привязана к реальной механике продукта из брифа — переписать её перед выводом.
 
+═══════════════════════════════════
+РЕАЛИСТИЧНОСТЬ ОБРАЗА: ТОВАР ДОЛЖЕН СОЧЕТАТЬСЯ С ОСТАЛЬНОЙ ОДЕЖДОЙ КАК В РЕАЛЬНОЙ ЖИЗНИ
+═══════════════════════════════════
+Это утягивающая БАЗОВАЯ майка — по своей природе она либо самостоятельный топ, либо невидимый под-слой, который носят ПОД обычной одеждой (расстёгнутая рубашка, кардиган, жакет, платье-сарафан, джемпер), а не поверх и не вместо неё. Сценарий, в котором персонаж надевает товар поверх или под ДРУГУЮ утягивающую/компрессионную вещь (боди, корсет, утягивающее бельё, другой шейпер), или комбинирует его нелогично с точки зрения обычного человека — это НЕДОПУСТИМАЯ ошибка: она ломает доверие зрителя и читается как бессмысленный ИИ-набор вещей, а не как реальный образ. Прежде чем писать script, мысленно проверь: реальная девушка правда так оденется и правда так скомбинирует эти вещи? Если нет — придумай другую, жизненную комбинацию.
+Ориентируйся на актуальную логику базового гардероба: майка-утяжка как база под лёгкую расстёгнутую рубашку/кардиган/жакет (проглядывает в вырезе или на выходе из-под верхнего слоя), как самостоятельный топ с джинсами/юбкой/брюками (образ «на выход»), под сарафан или платье на бретелях вместо белья, либо slip dress под пиджак. Комбинируй товар с базовым, минималистичным гардеробом (капсульный гардероб, «тихая роскошь», oversized-верх поверх приталенной базы) — это то, что реально носят сейчас, а не выдуманные сочетания. Если бриф или ретроспектива блогера дают понять его собственный стиль (спортивный, повседневный, вечерний) — комбинация должна соответствовать именно ему.
+
 Твоя задача для КАЖДОГО сценария:
 1. Бесшовная интеграция: сценарий должен выглядеть как естественная часть жизни блогера («показывай, а не рассказывай», ноль срежиссированности). Упор на эстетику в кадре, визуальную трансформацию, посадку или решение боли, без продажи «в лоб» и без рекламных клише.
 2. Legal compliance: включи чёткую инструкцию по маркировке рекламы согласно законодательству (поле ad_marking_note) — строгое требование, не опционально.
@@ -834,6 +935,7 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
 — anchor_url/anchor_views/anchor_er дословно совпадают с source_video_* соответствующего паттерна из входных данных?
 — forecast_views_low/forecast_views_high/forecast_er, virality_probability (число 0-100), virality_reasoning и best_posting_time_msk заполнены (кроме best_posting_time_msk, где допустимо честно написать "недостаточно данных")?
 — hook и script держатся именно на анатомии конкретного паттерна, а не звучат как сценарий про любой другой товар?
+— товар и остальная одежда в кадре сочетаются так, как реальный человек носил бы их (без надевания одной утягивающей вещи на/под другую, без нелепых или невозможных сочетаний)?
 Если хотя бы один ответ «нет» — исправь перед выводом.
 
 {humanize_block}
@@ -875,7 +977,8 @@ DEFAULT_EDITOR_SYSTEM_PROMPT = """Ты — Редактор и контролё�
 2. ПРИВЯЗКА К АНАТОМИИ ПАТТЕРНА. Хук и сценарий должны держаться на конкретных деталях из evidence паттерна (структура хука, темп, визуальный приём, лексика блогера). Если сценарий можно один в один вставить под любой другой товар или любого другого блогера без потери смысла — это провал уникальности, verdict="revise".
 3. ЖИВОЙ, НЕ-ИИ ТЕКСТ. Проверяй hook, script и caption на признаки шаблонного ИИ-текста: канцелярские обороты («играет ключевую роль», «в современном мире», «важно отметить»), тройные перечисления («быстро, стильно, удобно»), тире как разделитель посреди фразы, дежурные оптимистичные концовки, рекламные клише («это не просто майка, это...», «идеальное решение»). Если такое есть — verdict="revise" с конкретным указанием, что переписать.
 4. ЛЕГАЛЬНОСТЬ. Поле ad_marking_note должно содержать реальную инструкцию по маркировке рекламы, а не быть пустым или формальной отпиской.
-5. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный и нативный — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет и лимиты API).
+5. РЕАЛИСТИЧНОСТЬ ОБРАЗА. Товар — утягивающая БАЗОВАЯ майка: в реальной жизни её носят либо самостоятельным топом, либо невидимым под-слоем ПОД обычной одеждой (расстёгнутая рубашка, кардиган, жакет, платье-сарафан). Внимательно прочитай script и hook: если персонаж надевает товар поверх/под ДРУГУЮ утягивающую или компрессионную вещь (боди, корсет, бельё-утяжку, другой шейпер), либо в сценарии в принципе описана вещевая комбинация, которую реальный человек так не носит и не сочетает — это грубая логическая ошибка, а не мелочь. Даже при высоком fit_score и живом тексте такой сценарий получает verdict="revise" с конкретным указанием, какую комбинацию одежды заменить на жизненную.
+6. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный, нативный и вещи в кадре сочетаются реалистично — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые или нелепые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет и лимиты API).
 
 Если verdict="revise" — поле revision_notes должно быть конкретной инструкцией для сценариста: что именно усилить или переписать (не общие слова вроде «сделай лучше», а конкретика: «хук не привязан к анатомии паттерна — используй деталь из evidence про смену кадра на 0.5 секунде», «fit средний из-за того что товар вставлен поверх сценария, а не внутрь — переставь появление майки в момент смены образа, как в оригинале»).
 
@@ -974,7 +1077,8 @@ if "settings_loaded" not in st.session_state:
     st.session_state.cfg_sound_enabled = load_setting_bool("cfg_sound_enabled", True)
 
     st.session_state.cfg_data_source_mode = load_setting_str("cfg_data_source_mode", "apify")
-    st.session_state.cfg_apify_token = load_setting_str("cfg_apify_token", "")
+    # Одиночный cfg_apify_token остался только как источник для одноразовой миграции в таблицу
+    # apify_keys (см. init_db) — дальше ключи живут исключительно в пуле apify_keys.
     st.session_state.cfg_apify_actor = load_setting_str("cfg_apify_actor", "apify/instagram-reel-scraper")
     st.session_state.cfg_results_limit = load_setting_int("cfg_results_limit", 25)
     st.session_state.cfg_lookback_days = load_setting_int("cfg_lookback_days", 30)
@@ -1330,6 +1434,101 @@ def fetch_reels_via_apify(token, actor, targets, results_limit=None, lookback_da
     resp.raise_for_status()
     data = resp.json()
     return data if isinstance(data, list) else data.get("items", [])
+
+
+# ----------------------------------------------------------------------------
+# ЖИВАЯ ПРОВЕРКА ЛИМИТОВ КЛЮЧА APIFY + АВТОПЕРЕКЛЮЧЕНИЕ МЕЖДУ КЛЮЧАМИ
+# ----------------------------------------------------------------------------
+# Лимиты Apify — на уровне АККАУНТА, сбрасываются ежемесячно по собственному биллинг-циклу
+# аккаунта (не по фиксированной дате календаря и не через N дней после исчерпания). Официальный
+# способ узнать точный статус и дату сброса — эндпоинт GET /v2/users/me/limits, который возвращает
+# monthlyUsageCycle.endAt — именно ЕЁ мы показываем как «когда обновится» вместо того чтобы гадать
+# по дате добавления ключа. Поэтому маркер зелёный/красный держится не на догадке, а на последней
+# живой проверке через сам Apify.
+APIFY_LIMITS_URL = "https://api.apify.com/v2/users/me/limits"
+APIFY_USAGE_RED_THRESHOLD_PCT = 97  # помечаем ключ красным чуть ДО фактического исчерпания — с запасом
+
+def check_apify_key_live(token, timeout=20):
+    """Спрашивает у Apify реальный статус лимитов по токену. Возвращает dict:
+    {"ok": bool, "status": "green"|"red"|"unknown", "usage_pct": float|None, "usage_detail": str,
+     "cycle_reset_at": str|None, "error": str|None}."""
+    if httpx is None:
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": "Библиотека httpx не установлена"}
+    if not token:
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": "Пустой токен"}
+    try:
+        resp = httpx.get(APIFY_LIMITS_URL, params={"token": token}, timeout=timeout)
+        resp.raise_for_status()
+        payload = (resp.json() or {}).get("data", {}) or {}
+        limits = payload.get("limits", {}) or {}
+        current = payload.get("current", {}) or {}
+        cycle = payload.get("monthlyUsageCycle", {}) or {}
+
+        max_usd = limits.get("maxMonthlyUsageUsd")
+        cur_usd = current.get("monthlyUsageUsd")
+        usage_pct = None
+        if max_usd not in (None, 0) and cur_usd is not None:
+            usage_pct = round(cur_usd / max_usd * 100, 1)
+
+        status = "red" if (usage_pct is not None and usage_pct >= APIFY_USAGE_RED_THRESHOLD_PCT) else "green"
+        usage_detail = (
+            f"${cur_usd:.2f} из ${max_usd:.2f} за текущий цикл ({usage_pct}%)"
+            if (cur_usd is not None and max_usd) else "нет данных об использовании"
+        )
+        return {
+            "ok": True, "status": status, "usage_pct": usage_pct, "usage_detail": usage_detail,
+            "cycle_reset_at": cycle.get("endAt"), "error": None,
+        }
+    except Exception as exc:
+        return {"ok": False, "status": "unknown", "usage_pct": None, "usage_detail": "", "cycle_reset_at": None, "error": f"{type(exc).__name__}: {str(exc)[:200]}"}
+
+
+APIFY_LIMIT_ERROR_HINTS = [
+    "insufficient", "limit", "quota", "exceeded", "usage hard limit", "monthly usage",
+    "payment required", "402",
+]
+
+def is_apify_limit_error(exc: Exception) -> bool:
+    return any(hint in str(exc).lower() for hint in APIFY_LIMIT_ERROR_HINTS)
+
+
+def fetch_reels_via_apify_with_failover(actor, targets, results_limit=None, lookback_days=None,
+                                         include_transcript=False, timeout=300):
+    """Как fetch_reels_via_apify, но перебирает весь сохранённый пул Apify-ключей вместо одного
+    токена — тот же принцип автопереключения, что уже используется для моделей ИИ (см.
+    call_role_with_failover): пробуем ключи в порядке предпочтения (зелёные → непроверенные →
+    красные), при ошибке, похожей на исчерпание лимита, перепроверяем ключ напрямую у Apify,
+    фиксируем его реальный статус в базе и переходим к следующему. Возвращает
+    (items, token_used, attempts_log)."""
+    pool = get_apify_key_pool()
+    if not pool:
+        raise RuntimeError("Не добавлено ни одного Apify-ключа — добавьте его в разделе «Редактор менеджеров → Ключи Apify».")
+    attempts_log = []
+    last_exc = None
+    for key_rec in pool:
+        token = key_rec["token"]
+        token_tail = token[-4:] if len(token) >= 4 else token
+        try:
+            items = fetch_reels_via_apify(
+                token, actor, targets, results_limit=results_limit, lookback_days=lookback_days,
+                include_transcript=include_transcript, timeout=timeout,
+            )
+            attempts_log.append(f"Apify: сработал ключ …{token_tail}")
+            return items, token, attempts_log
+        except Exception as exc:
+            last_exc = exc
+            if is_apify_limit_error(exc):
+                live = check_apify_key_live(token)
+                update_apify_key_status(
+                    key_rec["id"], live.get("status") if live.get("ok") else "red",
+                    usage_pct=live.get("usage_pct"), usage_detail=live.get("usage_detail"),
+                    cycle_reset_at=live.get("cycle_reset_at"),
+                )
+                attempts_log.append(f"Apify: ключ …{token_tail} — похоже, исчерпан лимит, помечен красным, пробую следующий ключ")
+            else:
+                attempts_log.append(f"Apify: ключ …{token_tail} — {type(exc).__name__}: {exc}")
+    raise last_exc if last_exc is not None else RuntimeError("Не удалось получить данные ни по одному Apify-ключу")
+
 
 def apify_items_to_dataframe(items):
     rows = []
@@ -2620,7 +2819,14 @@ else:
         data_source_input = st.sidebar.selectbox("Источник данных", list(data_source_labels.keys()), index=list(data_source_labels.keys()).index(st.session_state.cfg_data_source_mode), format_func=lambda k: data_source_labels[k])
 
         if data_source_input == "apify":
-            apify_token_input = st.sidebar.text_input("Apify API-токен", value=st.session_state.cfg_apify_token, type="password")
+            _apify_keys_preview = get_apify_keys()
+            _green_n = sum(1 for k in _apify_keys_preview if k.get("status") == "green")
+            _red_n = sum(1 for k in _apify_keys_preview if k.get("status") == "red")
+            _unknown_n = sum(1 for k in _apify_keys_preview if k.get("status") not in ("green", "red"))
+            st.sidebar.caption(
+                f"🔑 Ключей в пуле: {len(_apify_keys_preview)} · 🟢 {_green_n} · 🔴 {_red_n} · ⚪ {_unknown_n} — "
+                f"добавление, проверка и удаление ключей — на вкладке «👥 Редактор менеджеров → 🔑 Ключи Apify»."
+            )
             apify_actor_input = st.sidebar.text_input("Актор Apify", value=st.session_state.cfg_apify_actor)
             results_limit_input = st.sidebar.number_input("Роликов с профиля за раз", min_value=5, max_value=100, value=st.session_state.cfg_results_limit, step=5)
             lookback_days_input = st.sidebar.number_input("Глубина в днях", min_value=7, max_value=90, value=st.session_state.cfg_lookback_days, step=1)
@@ -2632,7 +2838,6 @@ else:
                      "(экономит лимиты Apify). Если старше — транскрипция обновляется полностью.",
             )
         else:
-            apify_token_input = st.session_state.cfg_apify_token
             apify_actor_input = st.session_state.cfg_apify_actor
             results_limit_input = st.session_state.cfg_results_limit
             lookback_days_input = st.session_state.cfg_lookback_days
@@ -2673,7 +2878,6 @@ else:
             st.session_state.cfg_sound_enabled = sound_enabled_input
 
             st.session_state.cfg_data_source_mode = data_source_input
-            st.session_state.cfg_apify_token = apify_token_input
             st.session_state.cfg_apify_actor = apify_actor_input
             st.session_state.cfg_results_limit = results_limit_input
             st.session_state.cfg_lookback_days = lookback_days_input
@@ -2709,7 +2913,6 @@ else:
             set_setting("cfg_sound_enabled", str(sound_enabled_input))
 
             set_setting("cfg_data_source_mode", data_source_input)
-            set_setting("cfg_apify_token", apify_token_input)
             set_setting("cfg_apify_actor", apify_actor_input)
             set_setting("cfg_results_limit", str(results_limit_input))
             set_setting("cfg_lookback_days", str(lookback_days_input))
@@ -2984,6 +3187,101 @@ else:
                                     st.rerun()
                                 else: st.error(msg)
 
+            st.markdown("---")
+            st.markdown("#### <i class='fa-solid fa-key'></i> Ключи Apify", unsafe_allow_html=True)
+            st.caption(
+                "Лимиты Apify считаются на уровне аккаунта (не отдельного токена) и сбрасываются раз в месяц "
+                "по собственному биллинг-циклу аккаунта — не по фиксированной календарной дате и не через "
+                "N дней после исчерпания. Поэтому дата «сброс лимита» ниже — не наш расчёт, а то, что прямо "
+                "отдаёт сам Apify при проверке ключа. Можно добавить сколько угодно ключей: если у активного "
+                "закончились лимиты (🔴), система сама попробует следующий ключ с доступными лимитами (🟢)."
+            )
+
+            with st.form("add_apify_key_form", clear_on_submit=True):
+                akc1, akc2 = st.columns([4, 1])
+                with akc1:
+                    new_apify_key_value = st.text_input(
+                        "Новый Apify API-токен", placeholder="apify_api_...", label_visibility="collapsed",
+                    )
+                with akc2:
+                    add_key_submitted = st.form_submit_button("➕ Добавить", use_container_width=True, type="primary")
+                if add_key_submitted:
+                    token_to_add = (new_apify_key_value or "").strip()
+                    ok, msg = add_apify_key(token_to_add)
+                    if ok:
+                        new_rec = next((k for k in get_apify_keys() if k["token"] == token_to_add), None)
+                        if new_rec:
+                            live = check_apify_key_live(token_to_add)
+                            update_apify_key_status(
+                                new_rec["id"], live.get("status") if live.get("ok") else "unknown",
+                                usage_pct=live.get("usage_pct"), usage_detail=live.get("usage_detail"),
+                                cycle_reset_at=live.get("cycle_reset_at"),
+                            )
+                        st.success(msg)
+                        st.rerun()
+                    else:
+                        st.error(msg)
+
+            apify_keys_list = get_apify_keys()
+            if not apify_keys_list:
+                st.caption("Ключей ещё нет — добавьте хотя бы один выше, иначе автоматический сбор роликов через Apify работать не будет.")
+            else:
+                if st.button("🔄 Проверить все ключи", use_container_width=True, key="check_all_apify_keys"):
+                    for _k in apify_keys_list:
+                        _live = check_apify_key_live(_k["token"])
+                        update_apify_key_status(
+                            _k["id"], _live.get("status") if _live.get("ok") else "unknown",
+                            usage_pct=_live.get("usage_pct"), usage_detail=_live.get("usage_detail"),
+                            cycle_reset_at=_live.get("cycle_reset_at"),
+                        )
+                    st.rerun()
+
+                for k in apify_keys_list:
+                    marker = {"green": "🟢", "red": "🔴"}.get(k.get("status"), "⚪")
+                    token = k["token"]
+                    masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else f"…{token[-4:]}"
+                    added = (k.get("date_added") or "").replace("T", " ")[:16]
+                    checked = (k.get("last_checked_at") or "").replace("T", " ")[:16] or "не проверялся"
+                    reset_at = k.get("cycle_reset_at")
+                    reset_str = reset_at[:10] if reset_at else "неизвестно — нажмите «Проверить»"
+                    usage_detail = k.get("usage_detail") or "нет данных — нажмите «Проверить»"
+
+                    st.markdown(f"""
+                        <div class="history-card fade-in-container">
+                            <div style="display:flex; justify-content:space-between; align-items:flex-start;">
+                                <div class="history-handle">{marker} {html.escape(masked)}</div>
+                                <div class="history-date">добавлен: {added}</div>
+                            </div>
+                            <div>
+                                <span class="history-chip">📊 {html.escape(usage_detail)}</span>
+                                <span class="history-chip">🔁 сброс лимита (по данным Apify): {html.escape(reset_str)}</span>
+                                <span class="history-chip">🕓 проверен: {checked}</span>
+                            </div>
+                        </div>
+                    """, unsafe_allow_html=True)
+
+                    kc1, kc2 = st.columns(2)
+                    with kc1:
+                        if st.button("🔄 Проверить", key=f"check_apify_{k['id']}", use_container_width=True):
+                            live = check_apify_key_live(token)
+                            if live.get("ok"):
+                                update_apify_key_status(
+                                    k["id"], live["status"], usage_pct=live.get("usage_pct"),
+                                    usage_detail=live.get("usage_detail"), cycle_reset_at=live.get("cycle_reset_at"),
+                                )
+                                st.success("🟢 Лимиты есть." if live["status"] == "green" else "🔴 Лимит почти/полностью исчерпан.")
+                            else:
+                                st.error(f"Не удалось проверить: {live.get('error')}")
+                            st.rerun()
+                    with kc2:
+                        if st.button("🗑 Удалить", key=f"del_apify_{k['id']}", use_container_width=True):
+                            ok, msg = delete_apify_key(k["id"])
+                            if ok:
+                                st.success(msg)
+                                st.rerun()
+                            else:
+                                st.error(msg)
+
     with tab_history:
         if is_admin:
             stats = get_manager_stats()
@@ -3137,19 +3435,21 @@ else:
                     st.session_state.reels_data = edited_df
                     raw_df = edited_df
                 else:
-                    if not st.session_state.cfg_apify_token:
-                        st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation"></i> Не задан Apify API-токен — впишите его в панели администратора.</div>""", unsafe_allow_html=True)
+                    if not get_apify_keys():
+                        st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation"></i> Не добавлено ни одного Apify-ключа — добавьте его на вкладке «👥 Редактор менеджеров → 🔑 Ключи Apify».</div>""", unsafe_allow_html=True)
                     else:
                         username = extract_instagram_username(blogger_url)
                         with st.spinner(f"Собираю ролики @{username} через Apify..."):
                             try:
-                                items = fetch_reels_via_apify(
-                                    st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
+                                items, apify_token_used, apify_failover_log = fetch_reels_via_apify_with_failover(
+                                    st.session_state.cfg_apify_actor,
                                     targets=[username], results_limit=st.session_state.cfg_results_limit,
                                     lookback_days=st.session_state.cfg_lookback_days, include_transcript=False,
                                 )
                                 apify_debug_raw = items[0] if items else "(пустой список)"
                                 raw_df = apify_items_to_dataframe(items)
+                                if len(apify_failover_log) > 1:
+                                    st.caption(f"🔁 Переключился на другой Apify-ключ (…{apify_token_used[-4:]}) — предыдущий, похоже, исчерпал лимит.")
                             except Exception as exc:
                                 apify_debug_error = f"{type(exc).__name__}: {exc}"
 
@@ -3172,7 +3472,7 @@ else:
                         if not threshold_met:
                             st.markdown(f"""<div class="custom-warning fade-in-container"><i class="fa-solid fa-triangle-exclamation"></i> Ни один ролик не превысил порог {active_viral_threshold}x медианы.</div>""", unsafe_allow_html=True)
 
-                        if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript and st.session_state.cfg_apify_token and not top_viral_df.empty):
+                        if (active_data_source_mode == "apify" and st.session_state.cfg_include_transcript and get_apify_keys() and not top_viral_df.empty):
                             top_links = [l for l in top_viral_df["Ссылка на ролик"].tolist() if l]
                             if top_links:
                                 # --- Сначала пробуем переиспользовать уже сохранённую транскрипцию этого
@@ -3202,8 +3502,8 @@ else:
                                     )
                                     with st.spinner(spinner_text):
                                         try:
-                                            transcript_items = fetch_reels_via_apify(
-                                                st.session_state.cfg_apify_token, st.session_state.cfg_apify_actor,
+                                            transcript_items, _transcript_token_used, _transcript_failover_log = fetch_reels_via_apify_with_failover(
+                                                st.session_state.cfg_apify_actor,
                                                 targets=missing_links, results_limit=None, lookback_days=None,
                                                 include_transcript=True, timeout=420,
                                             )
