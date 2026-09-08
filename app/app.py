@@ -3,7 +3,6 @@
 # Запуск: streamlit run blogger_reels_analyzer.py
 
 import json
-import os
 import re
 import time
 import sqlite3
@@ -33,13 +32,6 @@ try:
     from anthropic import Anthropic
 except ImportError:
     Anthropic = None
-
-try:
-    import psycopg2
-    import psycopg2.extras
-    import psycopg2.errors
-except ImportError:
-    psycopg2 = None
 
 # ============================================================================
 # НАСТРОЙКА СТРАНИЦЫ
@@ -421,151 +413,23 @@ try {{
 """, height=0, width=0)
 
 # ============================================================================
-# ХРАНИЛИЩЕ ДАННЫХ (Supabase Postgres)
-# ----------------------------------------------------------------------------
-# Раньше здесь был локальный файл SQLite рядом со скриптом. На бесплатном
-# Streamlit Community Cloud контейнер пересобирается с нуля при каждом
-# передеплое и после «засыпания» от бездействия — вместе с ним обнулялся и
-# этот файл, а с ним ключи Apify, ключ ИИ-провайдера, менеджеры и история
-# анализов. Теперь всё это хранится в бесплатной базе Postgres на Supabase —
-# она живёт отдельно и от контейнера Streamlit, и от вашего компьютера, и не
-# пропадает ни при передеплое, ни при простое.
-#
-# Строка подключения (SUPABASE_DB_URL) НЕ хранится в коде — репозиторий
-# публичный. Она задаётся в Secrets приложения (Streamlit Cloud → Settings →
-# Secrets) либо в переменной окружения с тем же именем при локальном запуске.
-# Подробности и точные шаги — в SUPABASE_SETUP.md рядом с этим файлом.
+# ХРАНИЛИЩЕ ДАННЫХ (SQLite)
+# ВНИМАНИЕ: На бесплатных серверах вроде Streamlit Community Cloud эта БД
+# обнуляется при перезапуске (засыпании) сервера. Для продакшена используйте
+# внешнее облачное хранилище.
 # ============================================================================
-
-def _get_supabase_dsn():
-    """Строка подключения к Postgres на Supabase: сначала ищем в st.secrets
-    (так задаётся на Streamlit Cloud), затем в переменной окружения — это
-    удобно для локального запуска на своём компьютере."""
-    dsn = None
-    try:
-        dsn = st.secrets.get("SUPABASE_DB_URL")
-    except Exception:
-        dsn = None
-    if not dsn:
-        dsn = os.environ.get("SUPABASE_DB_URL")
-    return (dsn or "").strip() or None
-
-
-class _PGCursorCompat:
-    """Тонкая обёртка над курсором psycopg2, которая ведёт себя как
-    sqlite3.Cursor ровно настолько, насколько нужно остальному коду ниже:
-    execute() с плейсхолдерами '?', fetchone()/fetchall(), доступ к колонке
-    по имени и cur.lastrowid. Благодаря ей все функции работы с БД дальше по
-    файлу не пришлось переписывать построчно под Postgres."""
-
-    def __init__(self, raw_cursor):
-        self._cur = raw_cursor
-        self.lastrowid = None
-
-    @staticmethod
-    def _translate(sql):
-        # SQLite → Postgres: другой символ плейсхолдера и один устаревший
-        # синтаксис, который встречается только в одноразовой миграции
-        # старых данных (там же есть ON CONFLICT-эквивалент не нужен —
-        # смотри комментарий в init_db).
-        sql = sql.replace("INSERT OR IGNORE", "INSERT")
-        return sql.replace("?", "%s")
-
-    def execute(self, sql, params=()):
-        try:
-            self._cur.execute(self._translate(sql), params)
-        except psycopg2.errors.UniqueViolation as exc:
-            self._cur.connection.rollback()
-            raise sqlite3.IntegrityError(str(exc)) from exc
-        if sql.strip().upper().startswith("INSERT"):
-            # Эмулируем sqlite3-шный cur.lastrowid через lastval() — работает,
-            # потому что на каждый db_connect() у нас новое соединение и это
-            # тот же самый только что использованный sequence от SERIAL id.
-            # Таблицы без SERIAL-колонки (например app_settings) не использовали
-            # никакой sequence в этом соединении, и lastval() в таком случае упадёт
-            # с ошибкой — в Postgres (в отличие от SQLite) это переводит всю
-            # транзакцию в "aborted"-состояние, и без SAVEPOINT последующий COMMIT
-            # молча откатил бы уже выполненную вставку. SAVEPOINT изолирует именно
-            # эту проверку, не трогая основной запрос.
-            try:
-                self._cur.execute("SAVEPOINT lastval_probe")
-                self._cur.execute("SELECT lastval() AS v")
-                self.lastrowid = self._cur.fetchone()["v"]
-                self._cur.execute("RELEASE SAVEPOINT lastval_probe")
-            except Exception:
-                self.lastrowid = None
-                try:
-                    self._cur.execute("ROLLBACK TO SAVEPOINT lastval_probe")
-                except Exception:
-                    pass
-        return self
-
-    def executemany(self, sql, seq_of_params):
-        try:
-            self._cur.executemany(self._translate(sql), seq_of_params)
-        except psycopg2.errors.UniqueViolation as exc:
-            self._cur.connection.rollback()
-            raise sqlite3.IntegrityError(str(exc)) from exc
-        return self
-
-    def fetchone(self):
-        return self._cur.fetchone()
-
-    def fetchall(self):
-        return self._cur.fetchall()
-
-
-class _PGConnCompat:
-    """Обёртка над соединением psycopg2 с интерфейсом sqlite3.Connection —
-    conn.execute(...), conn.executemany(...) и поведение как у контекстного
-    менеджера с автокоммитом при выходе (как это уже было у sqlite3 в коде
-    ниже: `with db_connect() as conn: ...`)."""
-
-    def __init__(self, raw_conn):
-        self._conn = raw_conn
-
-    def execute(self, sql, params=()):
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        return _PGCursorCompat(cur).execute(sql, params)
-
-    def executemany(self, sql, seq_of_params):
-        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        return _PGCursorCompat(cur).executemany(sql, seq_of_params)
-
-    def __enter__(self):
-        return self
-
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        try:
-            if exc_type is None:
-                self._conn.commit()
-            else:
-                self._conn.rollback()
-        finally:
-            self._conn.close()
-        return False
-
+DB_PATH = Path(__file__).parent / "blogger_analyses.db"
 
 def db_connect():
-    if psycopg2 is None:
-        raise RuntimeError(
-            "Библиотека psycopg2-binary не установлена — добавьте её в requirements.txt "
-            "(см. SUPABASE_SETUP.md)."
-        )
-    dsn = _get_supabase_dsn()
-    if not dsn:
-        raise RuntimeError(
-            "Не настроено подключение к Supabase: добавьте SUPABASE_DB_URL в Secrets приложения "
-            "(Streamlit Cloud → Settings → Secrets) — см. SUPABASE_SETUP.md."
-        )
-    raw_conn = psycopg2.connect(dsn, connect_timeout=10)
-    return _PGConnCompat(raw_conn)
+    conn = sqlite3.connect(DB_PATH, timeout=10)
+    conn.row_factory = sqlite3.Row
+    return conn
 
 def init_db():
     with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS analyses (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 manager TEXT NOT NULL,
                 blogger_url TEXT NOT NULL,
                 blogger_handle TEXT,
@@ -585,13 +449,16 @@ def init_db():
         """)
         # Миграция для баз, созданных до разделения ИИ на роли «Аналитик» / «Сценарист»:
         # аккуратно добавляем недостающие колонки, не трогая уже накопленную историю.
-        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS model_used_analyst TEXT")
-        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS model_used_scenarist TEXT")
+        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(analyses)").fetchall()}
+        if "model_used_analyst" not in existing_cols:
+            conn.execute("ALTER TABLE analyses ADD COLUMN model_used_analyst TEXT")
+        if "model_used_scenarist" not in existing_cols:
+            conn.execute("ALTER TABLE analyses ADD COLUMN model_used_scenarist TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS managers (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 name TEXT NOT NULL UNIQUE,
                 password_hash TEXT,
                 salt TEXT,
@@ -607,7 +474,7 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS apify_keys (
-                id SERIAL PRIMARY KEY,
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
                 token TEXT NOT NULL UNIQUE,
                 label TEXT,
                 date_added TEXT NOT NULL,
@@ -1165,14 +1032,7 @@ DEFAULT_EDITOR_AUTO_MODELS = [
     "minimax/minimax-m3:free",
 ]
 
-try:
-    init_db()
-except RuntimeError as _db_setup_error:
-    st.error(
-        "⚠️ Не удалось подключиться к базе данных Supabase.\n\n"
-        f"{_db_setup_error}"
-    )
-    st.stop()
+init_db()
 
 if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
@@ -3616,12 +3476,7 @@ else:
                 for k in apify_keys_list:
                     marker = {"green": "🟢", "red": "🔴"}.get(k.get("status"), "⚪")
                     token = k["token"]
-                    show_key_flag = f"show_apify_{k['id']}"
-                    if show_key_flag not in st.session_state:
-                        st.session_state[show_key_flag] = False
-                    is_revealed = st.session_state[show_key_flag]
                     masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else f"…{token[-4:]}"
-                    display_token = token if is_revealed else masked
                     added = (k.get("date_added") or "").replace("T", " ")[:16]
                     checked = (k.get("last_checked_at") or "").replace("T", " ")[:16] or "не проверялся"
                     reset_at = k.get("cycle_reset_at")
@@ -3631,7 +3486,7 @@ else:
                     st.markdown(f"""
                         <div class="history-card fade-in-container">
                             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                                <div class="history-handle">{marker} {html.escape(display_token)}</div>
+                                <div class="history-handle">{marker} {html.escape(masked)}</div>
                                 <div class="history-date">добавлен: {added}</div>
                             </div>
                             <div>
@@ -3642,7 +3497,7 @@ else:
                         </div>
                     """, unsafe_allow_html=True)
 
-                    kc1, kc2, kc3 = st.columns(3)
+                    kc1, kc2 = st.columns(2)
                     with kc1:
                         if st.button("🔄 Проверить", key=f"check_apify_{k['id']}", use_container_width=True):
                             live = check_apify_key_live(token)
@@ -3661,11 +3516,6 @@ else:
                                 st.error(f"Не удалось проверить: {live.get('error')}")
                             st.rerun()
                     with kc2:
-                        eye_label = "🙈 Скрыть ключ" if is_revealed else "👁 Показать ключ"
-                        if st.button(eye_label, key=f"eye_apify_{k['id']}", use_container_width=True):
-                            st.session_state[show_key_flag] = not is_revealed
-                            st.rerun()
-                    with kc3:
                         if st.button("🗑 Удалить", key=f"del_apify_{k['id']}", use_container_width=True):
                             ok, msg = delete_apify_key(k["id"])
                             if ok:
@@ -3673,28 +3523,6 @@ else:
                                 st.rerun()
                             else:
                                 st.error(msg)
-
-                    if is_revealed:
-                        edit_c1, edit_c2 = st.columns([4, 1])
-                        with edit_c1:
-                            edited_token_value = st.text_input(
-                                "Полный ключ (можно отредактировать и сохранить)",
-                                value=token, key=f"edit_apify_{k['id']}", label_visibility="collapsed",
-                            )
-                        with edit_c2:
-                            if st.button("💾 Сохранить", key=f"save_apify_{k['id']}", use_container_width=True):
-                                new_token_value = sanitize_apify_token(edited_token_value)
-                                if not new_token_value:
-                                    st.error("Ключ не может быть пустым.")
-                                elif new_token_value == token:
-                                    st.info("Изменений нет.")
-                                else:
-                                    if update_apify_key_token(k["id"], new_token_value):
-                                        st.success("Ключ обновлён.")
-                                        st.session_state[show_key_flag] = False
-                                        st.rerun()
-                                    else:
-                                        st.error("Не удалось сохранить ключ — возможно, такой ключ уже есть в списке.")
 
     with tab_history:
         if is_admin:
