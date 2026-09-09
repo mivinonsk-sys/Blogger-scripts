@@ -3,6 +3,7 @@
 # Запуск: streamlit run blogger_reels_analyzer.py
 
 import json
+import os
 import re
 import time
 import sqlite3
@@ -32,6 +33,13 @@ try:
     from anthropic import Anthropic
 except ImportError:
     Anthropic = None
+
+try:
+    import psycopg2
+    import psycopg2.extras
+    import psycopg2.errors
+except ImportError:
+    psycopg2 = None
 
 # ============================================================================
 # НАСТРОЙКА СТРАНИЦЫ
@@ -413,23 +421,361 @@ try {{
 """, height=0, width=0)
 
 # ============================================================================
-# ХРАНИЛИЩЕ ДАННЫХ (SQLite)
-# ВНИМАНИЕ: На бесплатных серверах вроде Streamlit Community Cloud эта БД
-# обнуляется при перезапуске (засыпании) сервера. Для продакшена используйте
-# внешнее облачное хранилище.
+# ХРАНИЛИЩЕ ДАННЫХ (Supabase Postgres)
+# ----------------------------------------------------------------------------
+# Раньше здесь был локальный файл SQLite рядом со скриптом. На бесплатном
+# Streamlit Community Cloud контейнер пересобирается с нуля при каждом
+# передеплое и после «засыпания» от бездействия — вместе с ним обнулялся и
+# этот файл, а с ним ключи Apify, ключ ИИ-провайдера, менеджеры и история
+# анализов. Теперь всё это хранится в бесплатной базе Postgres на Supabase —
+# она живёт отдельно и от контейнера Streamlit, и от вашего компьютера, и не
+# пропадает ни при передеплое, ни при простое.
+#
+# Строка подключения (SUPABASE_DB_URL) НЕ хранится в коде — репозиторий
+# публичный. Она задаётся в Secrets приложения (Streamlit Cloud → Settings →
+# Secrets) либо в переменной окружения с тем же именем при локальном запуске.
+# Подробности и точные шаги — в SUPABASE_SETUP.md рядом с этим файлом.
 # ============================================================================
-DB_PATH = Path(__file__).parent / "blogger_analyses.db"
+
+def _get_supabase_dsn():
+    """Строка подключения к Postgres на Supabase: сначала ищем в st.secrets
+    (так задаётся на Streamlit Cloud), затем в переменной окружения — это
+    удобно для локального запуска на своём компьютере."""
+    dsn = None
+    try:
+        dsn = st.secrets.get("SUPABASE_DB_URL")
+    except Exception:
+        dsn = None
+    if not dsn:
+        dsn = os.environ.get("SUPABASE_DB_URL")
+    return (dsn or "").strip() or None
+
+
+class _PGCursorCompat:
+    """Тонкая обёртка над курсором psycopg2, которая ведёт себя как
+    sqlite3.Cursor ровно настолько, насколько нужно остальному коду ниже:
+    execute() с плейсхолдерами '?', fetchone()/fetchall(), доступ к колонке
+    по имени и cur.lastrowid. Благодаря ей все функции работы с БД дальше по
+    файлу не пришлось переписывать построчно под Postgres."""
+
+    def __init__(self, raw_cursor):
+        self._cur = raw_cursor
+        self.lastrowid = None
+
+    @staticmethod
+    def _translate(sql):
+        # SQLite → Postgres: другой символ плейсхолдера и один устаревший
+        # синтаксис, который встречается только в одноразовой миграции
+        # старых данных (там же есть ON CONFLICT-эквивалент не нужен —
+        # смотри комментарий в init_db).
+        sql = sql.replace("INSERT OR IGNORE", "INSERT")
+        return sql.replace("?", "%s")
+
+    def execute(self, sql, params=()):
+        try:
+            self._cur.execute(self._translate(sql), params)
+        except psycopg2.errors.UniqueViolation as exc:
+            self._cur.connection.rollback()
+            raise sqlite3.IntegrityError(str(exc)) from exc
+        if sql.strip().upper().startswith("INSERT"):
+            # Эмулируем sqlite3-шный cur.lastrowid через lastval() — работает,
+            # потому что на каждый db_connect() у нас новое соединение и это
+            # тот же самый только что использованный sequence от SERIAL id.
+            # Таблицы без SERIAL-колонки (например app_settings) не использовали
+            # никакой sequence в этом соединении, и lastval() в таком случае упадёт
+            # с ошибкой — в Postgres (в отличие от SQLite) это переводит всю
+            # транзакцию в "aborted"-состояние, и без SAVEPOINT последующий COMMIT
+            # молча откатил бы уже выполненную вставку. SAVEPOINT изолирует именно
+            # эту проверку, не трогая основной запрос.
+            try:
+                self._cur.execute("SAVEPOINT lastval_probe")
+                self._cur.execute("SELECT lastval() AS v")
+                self.lastrowid = self._cur.fetchone()["v"]
+                self._cur.execute("RELEASE SAVEPOINT lastval_probe")
+            except Exception:
+                self.lastrowid = None
+                try:
+                    self._cur.execute("ROLLBACK TO SAVEPOINT lastval_probe")
+                except Exception:
+                    pass
+        return self
+
+    def executemany(self, sql, seq_of_params):
+        try:
+            self._cur.executemany(self._translate(sql), seq_of_params)
+        except psycopg2.errors.UniqueViolation as exc:
+            self._cur.connection.rollback()
+            raise sqlite3.IntegrityError(str(exc)) from exc
+        return self
+
+    def fetchone(self):
+        return self._cur.fetchone()
+
+    def fetchall(self):
+        return self._cur.fetchall()
+
+
+class _PGConnCompat:
+    """Обёртка над соединением psycopg2 с интерфейсом sqlite3.Connection —
+    conn.execute(...), conn.executemany(...) и поведение как у контекстного
+    менеджера с автокоммитом при выходе (как это уже было у sqlite3 в коде
+    ниже: `with db_connect() as conn: ...`)."""
+
+    def __init__(self, raw_conn):
+        self._conn = raw_conn
+
+    def execute(self, sql, params=()):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return _PGCursorCompat(cur).execute(sql, params)
+
+    def executemany(self, sql, seq_of_params):
+        cur = self._conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        return _PGCursorCompat(cur).executemany(sql, seq_of_params)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        try:
+            if exc_type is None:
+                self._conn.commit()
+            else:
+                self._conn.rollback()
+        finally:
+            self._conn.close()
+        return False
+
 
 def db_connect():
-    conn = sqlite3.connect(DB_PATH, timeout=10)
-    conn.row_factory = sqlite3.Row
-    return conn
+    if psycopg2 is None:
+        raise RuntimeError(
+            "Библиотека psycopg2-binary не установлена — добавьте её в requirements.txt "
+            "(см. SUPABASE_SETUP.md)."
+        )
+    dsn = _get_supabase_dsn()
+    if not dsn:
+        raise RuntimeError(
+            "Не настроено подключение к Supabase: добавьте SUPABASE_DB_URL в Secrets приложения "
+            "(Streamlit Cloud → Settings → Secrets) — см. SUPABASE_SETUP.md."
+        )
+    raw_conn = psycopg2.connect(dsn, connect_timeout=10)
+    return _PGConnCompat(raw_conn)
+
+def init_hypotheses_db():
+    """Таблицы базы гипотез поверх существующей Supabase-схемы. Вызывается из init_db(),
+    безопасно перезапускаема (CREATE TABLE IF NOT EXISTS / ADD COLUMN IF NOT EXISTS)."""
+    with db_connect() as conn:
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hypotheses (
+                id SERIAL PRIMARY KEY,
+                title TEXT NOT NULL,
+                video_url TEXT NOT NULL UNIQUE,
+                source_type TEXT NOT NULL DEFAULT 'external',   -- 'external' | 'own_test'
+                transcript TEXT,
+                format_tags TEXT[] NOT NULL DEFAULT '{}',
+                hook_type TEXT,
+                pain_point TEXT,
+                pain_point_tags TEXT[] NOT NULL DEFAULT '{}',
+                blogger_type_tags TEXT[] NOT NULL DEFAULT '{}',
+                why_viral TEXT,
+                anatomy_breakdown TEXT,
+                hypothesis_statement TEXT,
+                donor_views INTEGER,
+                donor_er REAL,
+                status TEXT NOT NULL DEFAULT 'active',          -- active | archived | retired
+                is_gold_standard BOOLEAN NOT NULL DEFAULT false,
+                times_used INTEGER NOT NULL DEFAULT 0,
+                times_confirmed_viral INTEGER NOT NULL DEFAULT 0,
+                added_by TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT
+            )
+        """)
+        conn.execute("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS pain_point_tags TEXT[] NOT NULL DEFAULT '{}'")
+        conn.execute("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS anatomy_breakdown TEXT")
+        conn.execute("ALTER TABLE hypotheses ADD COLUMN IF NOT EXISTS is_gold_standard BOOLEAN NOT NULL DEFAULT false")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hyp_format_tags ON hypotheses USING GIN (format_tags)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hyp_blogger_tags ON hypotheses USING GIN (blogger_type_tags)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hyp_pain_tags ON hypotheses USING GIN (pain_point_tags)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hyp_status ON hypotheses(status)")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS hypothesis_usage (
+                id SERIAL PRIMARY KEY,
+                hypothesis_id INTEGER NOT NULL REFERENCES hypotheses(id) ON DELETE CASCADE,
+                analysis_id INTEGER REFERENCES analyses(id) ON DELETE SET NULL,
+                blogger_url TEXT,
+                scenario_title TEXT,
+                match_score REAL,
+                used_at TEXT NOT NULL,
+                outcome TEXT NOT NULL DEFAULT 'ещё не известно', -- 'залетело' | 'средне' | 'не зашло' | 'ещё не известно'
+                actual_views INTEGER,
+                actual_er REAL,
+                notes TEXT
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_hyp_usage_hyp ON hypothesis_usage(hypothesis_id)")
+    with db_connect() as conn:
+        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS blogger_type_tags TEXT")
+        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS matched_hypotheses_json TEXT")
+
+
+def get_hypotheses(status="active", limit=500):
+    with db_connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM hypotheses WHERE status = ? ORDER BY created_at DESC LIMIT ?",
+            (status, limit),
+        ).fetchall()
+        return [dict(r) for r in rows]
+
+
+def match_hypotheses_for_blogger(blogger_type_tags, patterns_format_tags, audience_pain_points=None,
+                                  limit=4, min_score=1.0):
+    """Подбирает до `limit` активных гипотез под конкретного блогера — по пересечению тегов
+    (формат x3, боль x2.5, стиль x2), с бонусом за подтверждённую статистику и gold-standard флаг."""
+    bt_set = set(blogger_type_tags or [])
+    ft_set = set(patterns_format_tags or [])
+    pp_set = set(audience_pain_points or [])
+    scored = []
+    for h in get_hypotheses(status="active"):
+        h_bt = set(h.get("blogger_type_tags") or [])
+        h_ft = set(h.get("format_tags") or [])
+        h_pp = set(h.get("pain_point_tags") or [])
+        score = 2.0 * len(bt_set & h_bt) + 3.0 * len(ft_set & h_ft) + 2.5 * len(pp_set & h_pp)
+        if h.get("times_used", 0) >= 3:
+            score += (h["times_confirmed_viral"] / h["times_used"]) * 2.0
+        elif h.get("times_used", 0) > 0:
+            score += 0.3
+        if h.get("is_gold_standard"):
+            score += 1.0
+        if score >= min_score:
+            scored.append((score, h))
+    scored.sort(key=lambda x: x[0], reverse=True)
+    return [h for _, h in scored[:limit]]
+
+
+def build_hypotheses_prompt_block(matched_hypotheses):
+    if not matched_hypotheses:
+        return ""
+    records = []
+    for h in matched_hypotheses:
+        anatomy = h.get("anatomy_breakdown") or (h.get("transcript") or "")[:600]
+        records.append({
+            "id": h["id"],
+            "title": h["title"],
+            "hypothesis_statement": h.get("hypothesis_statement", ""),
+            "format_tags": h.get("format_tags", []),
+            "hook_type": h.get("hook_type", ""),
+            "pain_point": h.get("pain_point", ""),
+            "anatomy_breakdown": anatomy,
+            "is_gold_standard": bool(h.get("is_gold_standard")),
+            "proven_track_record": (
+                f"{h['times_confirmed_viral']}/{h['times_used']} прошлых интеграций залетело"
+                if h.get("times_used") else "ещё не проверялась на блогерах"
+            ),
+        })
+    return (
+        "\n\nПРОВЕРЕННЫЕ ГИПОТЕЗЫ БРЕНДА (подобраны под тип этого блогера и боли его аудитории, "
+        "НЕЗАВИСИМО от его личной ретроспективы — это внешний банк идей, а не анализ именно этого профиля):\n"
+        f"{json.dumps(records, ensure_ascii=False, indent=2)}\n"
+        "Правила использования — см. раздел «РОЛЬ ГИПОТЕЗ БРЕНДА» выше в инструкции. Если сценарий "
+        "использует идею гипотезы — заполни based_on_hypothesis (точное title), hypothesis_id и "
+        "hypothesis_fusion_trace; если ни одна гипотеза не подошла — оставь все три поля пустыми/null, "
+        "это нормально и не является ошибкой."
+    )
+
+
+def add_hypothesis(title, video_url, transcript=None, format_tags=None, blogger_type_tags=None,
+                    hook_type=None, pain_point=None, pain_point_tags=None, why_viral=None,
+                    anatomy_breakdown=None, hypothesis_statement=None, donor_views=None, donor_er=None,
+                    source_type="external", added_by=None, is_gold_standard=False):
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO hypotheses (title, video_url, source_type, transcript, format_tags, hook_type, "
+            "pain_point, pain_point_tags, blogger_type_tags, why_viral, anatomy_breakdown, "
+            "hypothesis_statement, donor_views, donor_er, added_by, is_gold_standard, created_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT (video_url) DO NOTHING",
+            (title, video_url, source_type, transcript, format_tags or [], hook_type, pain_point,
+             pain_point_tags or [], blogger_type_tags or [], why_viral, anatomy_breakdown,
+             hypothesis_statement, donor_views, donor_er, added_by, is_gold_standard, now),
+        )
+
+
+def ingest_hypothesis_from_url(video_url, apify_token, apify_actor, added_by, **kwargs):
+    """Транскрибирует ролик-гипотезу через тот же Apify-actor, что и профили блогеров (username
+    принимает прямую ссылку на Reels — подтверждено input-схемой apify/instagram-reel-scraper)."""
+    items = fetch_reels_via_apify(apify_token, apify_actor, targets=[video_url],
+                                   include_transcript=True, timeout=300)
+    df = apify_items_to_dataframe(items)
+    if df.empty:
+        raise RuntimeError("Apify не вернул данные по этой ссылке — проверьте, что ролик публичный и ссылка верна.")
+    row = df.iloc[0]
+    views = float(row["Просмотры"]) or 0
+    er = round((float(row["Лайки"]) + float(row["Комментарии"]) + float(row["Сохранения"])) / views * 100, 2) if views else None
+    return add_hypothesis(
+        title=kwargs.pop("title", None) or str(row["Что происходит в ролике (кратко)"])[:80] or video_url,
+        video_url=video_url, transcript=row["Транскрипция (если есть)"],
+        donor_views=int(views) if views else None, donor_er=er, added_by=added_by, **kwargs,
+    )
+
+
+def record_hypothesis_usage(hypothesis_id, analysis_id, blogger_url, scenario_title, match_score=None):
+    now = datetime.now().isoformat(timespec="seconds")
+    with db_connect() as conn:
+        conn.execute(
+            "INSERT INTO hypothesis_usage (hypothesis_id, analysis_id, blogger_url, scenario_title, match_score, used_at) "
+            "VALUES (?, ?, ?, ?, ?, ?)",
+            (hypothesis_id, analysis_id, blogger_url, scenario_title, match_score, now),
+        )
+        conn.execute("UPDATE hypotheses SET times_used = times_used + 1, updated_at = ? WHERE id = ?", (now, hypothesis_id))
+
+
+def update_hypothesis_outcome(usage_id, outcome, actual_views=None, actual_er=None, notes=None):
+    """outcome: 'залетело' | 'средне' | 'не зашло'."""
+    with db_connect() as conn:
+        conn.execute(
+            "UPDATE hypothesis_usage SET outcome = ?, actual_views = ?, actual_er = ?, notes = ? WHERE id = ?",
+            (outcome, actual_views, actual_er, notes, usage_id),
+        )
+        row = conn.execute("SELECT hypothesis_id FROM hypothesis_usage WHERE id = ?", (usage_id,)).fetchone()
+        if row and outcome == "залетело":
+            conn.execute(
+                "UPDATE hypotheses SET times_confirmed_viral = times_confirmed_viral + 1 WHERE id = ?",
+                (row["hypothesis_id"],),
+            )
+
+
+_HYPOTHESIS_ANATOMY_PROMPT = """Разбери анатомию этого ролика для базы гипотез бренда. Дай по-блочно, с
+таймкодами: что происходит в кадре, что говорится и что написано на экране (раздельно), к какой боли
+аудитории апеллирует, какой тип хука использован, где ретеншн-петля или её отсутствие, дословные
+характерные слова/обороты рассказчика (если это позволяет понять транскрипция). Не сглаживай лексику до
+литературной — если в ролике есть незаконченные фразы, сленг, самоирония — фиксируй дословно, это и есть
+материал для будущего переноса голоса другому блогеру. 3-6 абзацев, по существу, без маркетинговой воды.
+Верни результат СТРОГО в формате валидного JSON, без markdown: {{"anatomy_breakdown": "текст разбора"}}"""
+
+
+def run_hypothesis_anatomy_stage(video_url, transcript, caption, views,
+                                  provider_mode, base_url, api_key, mode, manual_model, auto_models, max_tokens):
+    """Один разовый вызов ИИ при добавлении гипотезы в базу — возвращает готовый текст для anatomy_breakdown."""
+    user_prompt = (
+        f"Ссылка на ролик: {video_url}\nПодпись/описание: {caption or '—'}\nПросмотры: {views or '—'}\n\n"
+        f"Транскрипция:\n{transcript or '(транскрипции нет — опиши по доступным данным, честно отметь пробел)'}"
+    )
+    parsed, raw_text, model_used, attempts_log = call_role_with_failover(
+        "Разбор гипотезы", provider_mode, base_url, api_key, mode, manual_model, auto_models,
+        _HYPOTHESIS_ANATOMY_PROMPT, user_prompt, max_tokens, required_keys=("anatomy_breakdown",),
+    )
+    if parsed is None:
+        return "", None, attempts_log
+    return parsed.get("anatomy_breakdown", ""), model_used, attempts_log
+
 
 def init_db():
     with db_connect() as conn:
         conn.execute("""
             CREATE TABLE IF NOT EXISTS analyses (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 manager TEXT NOT NULL,
                 blogger_url TEXT NOT NULL,
                 blogger_handle TEXT,
@@ -449,16 +795,13 @@ def init_db():
         """)
         # Миграция для баз, созданных до разделения ИИ на роли «Аналитик» / «Сценарист»:
         # аккуратно добавляем недостающие колонки, не трогая уже накопленную историю.
-        existing_cols = {row["name"] for row in conn.execute("PRAGMA table_info(analyses)").fetchall()}
-        if "model_used_analyst" not in existing_cols:
-            conn.execute("ALTER TABLE analyses ADD COLUMN model_used_analyst TEXT")
-        if "model_used_scenarist" not in existing_cols:
-            conn.execute("ALTER TABLE analyses ADD COLUMN model_used_scenarist TEXT")
+        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS model_used_analyst TEXT")
+        conn.execute("ALTER TABLE analyses ADD COLUMN IF NOT EXISTS model_used_scenarist TEXT")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_manager ON analyses(manager)")
         conn.execute("CREATE INDEX IF NOT EXISTS idx_created ON analyses(created_at)")
         conn.execute("""
             CREATE TABLE IF NOT EXISTS managers (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 name TEXT NOT NULL UNIQUE,
                 password_hash TEXT,
                 salt TEXT,
@@ -474,7 +817,7 @@ def init_db():
         """)
         conn.execute("""
             CREATE TABLE IF NOT EXISTS apify_keys (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                id SERIAL PRIMARY KEY,
                 token TEXT NOT NULL UNIQUE,
                 label TEXT,
                 date_added TEXT NOT NULL,
@@ -512,6 +855,7 @@ def init_db():
                 "INSERT INTO managers (name, password_hash, salt, is_active, created_at) VALUES (?, NULL, NULL, 1, ?)",
                 [(n, now) for n in seed],
             )
+        init_hypotheses_db()
 
 def hash_password(password: str, salt: str = None):
     if salt is None:
@@ -838,6 +1182,28 @@ _HUMANIZE_BLOCK_SCRIPTWRITER = """═══════════════�
 8. Не пиши шаблонное «Всем привет, смотрите какую майку я купила» и любые прямые заходы в духе классической рекламы — задача сценария ровно в обратном.
 Проверь каждый сценарий перед выводом: если хук или script можно один в один вставить в сценарий про любой другой товар у любого другого блогера — перепиши его так, чтобы он держался именно на анатомии конкретного anchor-ролика."""
 
+BLOGGER_TYPE_VOCAB = [
+    "эстетика_визуал", "юмор_скетчи", "сторителлинг_влог", "экспертность_советы",
+    "энергичный_монтаж", "атмосферный_спокойный", "эмоциональный_личный",
+    "трансформация_до_после", "grwm_рутина",
+]
+
+FORMAT_TAG_VOCAB = [
+    "лукбук", "примерка_у_зеркала", "grwm", "тест_одной_вещи",
+    "чек_лист_образов", "до_после_посадки", "распаковка",
+]
+
+HOOK_TYPE_VOCAB = [
+    "результат_товар_сразу", "опровержение_стереотипа", "конкретная_цифра",
+    "вопрос_петля", "прямая_команда", "экспертный_авторитет", "визуальный_разрыв",
+]
+
+PAIN_POINT_VOCAB = [
+    "жмет_давит", "просвечивает_под_одеждой", "скатывается_задирается",
+    "не_держит_грудь", "видно_на_сторис_фото", "неудобно_в_жару",
+    "не_ощущается_как_качественная_вещь", "неудобно_в_движении",
+]
+
 DEFAULT_ANALYST_SYSTEM_PROMPT = """Ты — Senior аналитик социальных сетей и медиабайер с многолетним опытом разбора Instagram Reels для инфлюенс-маркетинга. Твоя единственная задача — глубокая, честная аналитика профиля конкретного блогера: найти реально залётные (относительно его собственной медианы) ролики, разобрать их анатомию и подготовить список паттернов с проверяемыми данными. Сценарии ты НЕ пишешь — этим после тебя занимается отдельный сценарист, которому ты передаёшь результат своей работы.
 
 На вход поступает: (1) ретроспектива роликов блогера (метрики, описание, транскрипция где есть, дата публикации), (2) бриф продукта — он нужен тебе только чтобы понимать, какие форматы у блогера в принципе совместимы с демонстрацией физического товара; ты не встраиваешь товар в текст и не пишешь хуки.
@@ -883,6 +1249,25 @@ DEFAULT_ANALYST_SYSTEM_PROMPT = """Ты — Senior аналитик социал
 5. Время публикации: у роликов может быть поле «Время публикации (МСК)». Проанализируй его по всей ретроспективе, с особым вниманием к залётным роликам — если видишь повторяющееся окно публикации у успешных роликов, конкретного паттерна, укажи это текстом прямо в evidence этого паттерна (сценарист использует твоё наблюдение для best_posting_time_msk). Если данных недостаточно для вывода — не выдумывай.
 6. Паттерны и их источники (ключевое требование, выполняется для КАЖДОГО паттерна): каждый паттерн в массиве patterns ОБЯЗАН быть привязан к одному конкретному реальному ролику из входных данных — заполни source_video_url (точная ссылка, в точности как в поле «Ссылка на ролик» входных данных), source_video_views (фактический охват числом) и source_video_er (фактический ER% числом). Бери эти значения буквально из входных данных, ничего не выдумывай. Если паттерн подтверждается сразу несколькими роликами — укажи данные самого показательного/крупного из них, а остальные упомяни текстом в evidence. Эти три поля НИКОГДА не должны быть пустыми, null или «—».
 7. Brand Safety & Fit: если продукт концептуально разрушает образ блогера и ни один ролик не подходит структурно — прямо блокируй интеграцию в verdict_note, без компромиссов и притягивания форматов за уши.
+8. Тип блогера: определи 1-3 тега из строго заданного словаря, которые описывают СТИЛЬ подачи этого блогера
+   (не нишу и не тематику канала, а именно манеру: как он себя ведёт в кадре и как построен монтаж):
+   эстетика_визуал | юмор_скетчи | сторителлинг_влог | экспертность_советы | энергичный_монтаж |
+   атмосферный_спокойный | эмоциональный_личный | трансформация_до_после | grwm_рутина.
+   Опирайся на паттерны, которые ты уже нашёл, и на общий тон ретроспективы — не выдумывай тег, которого
+   не подтверждают ролики. Если блогер сочетает несколько стилей — укажи все подтверждённые, но не более 3.
+9. Боли аудитории: извлеки audience_pain_points — 1-3 тега из словаря
+   [жмет_давит | просвечивает_под_одеждой | скатывается_задирается | не_держит_грудь |
+   видно_на_сторис_фото | неудобно_в_жару | не_ощущается_как_качественная_вещь | неудобно_в_движении].
+   Бери их НЕ из своих предположений о продукте, а из прямых текстовых свидетельств в ретроспективе —
+   комментариев под роликами, реакций аудитории, повторяющихся жалоб/пожеланий, упомянутых блогером
+   или подписчиками. Каждый тег подтверждай конкретной цитатой в evidence. Нет явных свидетельств —
+   оставь массив пустым, это нормальный результат, не выдумывай ради заполнения поля.
+
+ПРИМЕР НУЖНОЙ КОНКРЕТИКИ EVIDENCE (ориентир, не шаблон для копирования):
+Недостаточно: «хук цепляет внимание».
+Нужно: «хук — блогер срывает с себя кофту на 0.7 секунде ролика, до первого слова, текст на экране в
+этот момент — "ДОЛОЙ ЛИФЧИКИ", заглавными, без знаков препинания».
+Разница — в способности сценариста ВОСПРОИЗВЕСТИ действие по твоему описанию, не пересматривая ролик.
 
 ФИНАЛЬНЫЙ ЧЕК-ЛИСТ ПЕРЕД ВЫВОДОМ (обязательно к каждому паттерну):
 — В КАЖДОМ объекте patterns заполнены source_video_url, source_video_views, source_video_er (не пусто, не «—», не null)?
@@ -906,12 +1291,14 @@ DEFAULT_ANALYST_SYSTEM_PROMPT = """Ты — Senior аналитик социал
       "source_video_er": 0.0
     }}
   ],
-  "verdict_note": "строка — честный вывод по fit блогера с товаром, включая жёсткий отказ, если он оправдан"
+  "verdict_note": "строка — честный вывод по fit блогера с товаром, включая жёсткий отказ, если он оправдан",
+  "blogger_type_tags": ["строка", "..."],
+  "audience_pain_points": ["строка", "..."]
 }}""".format(humanize_block=_HUMANIZE_BLOCK_ANALYST)
 
 DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный директор и сценарист с многолетним опытом работы с инфлюенс-блогерами. Ты получаешь готовую аналитику от коллеги-аналитика (список паттернов конкретного блогера с проверенными данными роликов-доноров и разбором их анатомии) и превращаешь её в готовые сценарии рекламной интеграции. Ты не придумываешь ролики с нуля и не ищешь паттерны заново — твоя специализация: брать УЖЕ ЗАЛЁТНЫЙ у блогера паттерн, переданный тебе аналитиком, и хирургически встраивать в него бренд так, что зритель не считывает рекламу. Ты пишешь так, как пишет сценарист, который лично знает блогера, помнит его интонацию и понимает, почему именно этот ролик выстрелил.
 
-На вход поступает: (1) ретроспектива роликов блогера, (2) бриф продукта, (3) ГОТОВЫЙ список паттернов от аналитика (поле "patterns" во входных данных) — по каждому паттерну уже указаны source_video_url/source_video_views/source_video_er и текстовый разбор анатомии ролика в evidence.
+На вход поступает: (1) ретроспектива роликов блогера, (2) бриф продукта, (3) ГОТОВЫЙ список паттернов от аналитика (поле "patterns" во входных данных) — по каждому паттерну уже указаны source_video_url/source_video_views/source_video_er и текстовый разбор анатомии ролика в evidence, (4) НЕОБЯЗАТЕЛЬНЫЙ блок «ПРОВЕРЕННЫЕ ГИПОТЕЗЫ БРЕНДА» — внешние идеи, не привязанные к этому блогеру.
 
 Твой ответ напрямую парсится автоматизированной системой — отклонение от формата недопустимо.
 
@@ -922,11 +1309,73 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
 
 Если список patterns пуст или ни один паттерн реально не описывает структурно совместимый с товаром формат — не изобретай сценарий вопреки этому: верни один сценарий с fit_score "низкий", где hook и script честно и по-деловому фиксируют нехватку подходящего материала, а anchor_url оставь пустым. Никогда не выдумывай несуществующий anchor-ролик.
 
+═══════════════════════════════════
+РОЛЬ ГИПОТЕЗ БРЕНДА (если блок «ПРОВЕРЕННЫЕ ГИПОТЕЗЫ БРЕНДА» присутствует во входных данных)
+═══════════════════════════════════
+Гипотеза — это НЕ замена паттерну блогера и НЕ альтернативный anchor. Форма сценария всегда берётся от
+паттерна, угол подачи — опционально от гипотезы. Разделяй строго:
+
+От паттерна блогера — всегда и только: дословный хук (конкретная фраза/действие первых 3 секунд из
+evidence), темп монтажа, лексика (слова-маркеры, интонация, которые блогер реально использует),
+визуальный сеттинг, скелет сцен и их порядок.
+
+От гипотезы — всегда и только: боль ЦА, которую она закрывает; эмоциональная/когнитивная механика,
+почему она цепляет (контраст, публичное смущение, интрига, social proof). Никогда не бери у гипотезы
+готовую фразу хука, чужой темп или чужую визуальную деталь — это ломает голос блогера и создаёт заметный
+шов из двух разных людей.
+
+Механика слияния (не наложения):
+1. Из гипотезы бери ровно одну вещь — формулировку боли/угла в одном предложении.
+2. В паттерне блогера ищи существующую сцену/деталь/объект действия, где эта боль может материализоваться
+   БЕЗ добавления новой сцены и без изменения скелета ролика — меняется предмет действия внутри уже
+   существующего кадра, не структура.
+3. Перепиши хук/реплику с сохранением ритма и лексики блогера, но с деталью, которая физически указывает
+   на боль из гипотезы.
+4. Контрольный тест: если убрать из головы факт использования гипотезы, сценарий должен читаться как
+   органичное развитие паттерна — не как два склеенных куска.
+
+Обязательное поле при использовании гипотезы — hypothesis_fusion_trace, ровно в этом формате (одна строка,
+три части через стрелку):
+"Боль/угол гипотезы: <дословно, коротко> → Материализовано как: <конкретная деталь/реплика в этом
+сценарии, с указанием блока — Визуальный ряд/Voiceover — и секунды> → Почему это форма блогера, а не
+гипотезы: <ссылка на конкретный элемент evidence паттерна>"
+Деталь из «материализовано как» ОБЯЗАНА дословно или близко к тексту встречаться в полях hook/script
+этого же сценария — иначе это не слияние, а наклейка.
+
+Влияние на virality_probability: заполненное based_on_hypothesis само по себе бонуса не даёт. Бонус
+(+5–10 п.п. к потолку, но не выше 85% в сумме) — только при ОБОИХ условиях: гипотеза статистически
+подтверждена (times_used >= 3 и times_confirmed_viral/times_used >= 0.5, судя по полю "proven_track_record"
+гипотезы) И деталь из hypothesis_fusion_trace реально присутствует в теле сценария. Если выполнено только
+одно из двух — вероятность считается как для сценария без гипотезы, без бонуса. Если бонус применён —
+virality_reasoning обязан явно процитировать статистику ("X/Y залетело ранее").
+
+Если ни одна гипотеза не подходит к выбранному паттерну — просто не используй их, based_on_hypothesis/
+hypothesis_id/hypothesis_fusion_trace остаются null. Это ожидаемая, нормальная ситуация — не притягивай
+гипотезу насильно.
+
+═══════════════════════════════════
+ЭТАЛОН КАЧЕСТВА (закреплённый пример — ориентир глубины и слияния, НЕ шаблон для копирования формулировок)
+═══════════════════════════════════
+Паттерн блогера (evidence, сокращённо): формат "честная примерка", хук — резкое физическое действие
+(снятие/надевание вещи) в первые 2 сек без вступительной реплики, текст на экране короткий и рубленый,
+дублирует речь ("Постаралось, подперлось" — не литературная фраза, разговорная, с проглоченными
+словами), обязательный честный минус вещи ("фасон короткие", "но..."), дуга к финалу — от простой базы
+к всё более спорным вещам, CTA — "переходите, пишите, какой образ разобрать".
+Гипотеза (пример): боль "майка теряет форму/просвечивает шов после стирки".
+Итоговое слияние: хук остаётся тем же физическим действием (снять кофту, показать параметры), но в кадр
+добавляется деталь, материализующая боль гипотезы — блогер той же разговорной интонацией комментирует
+именно эту деталь ("на мне размер 50... и вот смотрите, шов вообще не просвечивает, а я стираю эту дрянь
+через день") — деталь встроена в существующую реплику, а не добавлена отдельным блоком.
+hypothesis_fusion_trace для этого случая: "Боль/угол гипотезы: шов просвечивает после стирки →
+Материализовано как: реплика в hook на 3-4 секунде про то, что шов не виден после частой стирки →
+Почему это форма блогера: та же короткая рубленая манера текста на экране, что и в evidence
+('Постаралось, подперлось')".
+
 Шаг — перенос ДНК паттерна в сценарий:
 Для каждого выбранного паттерна перенеси в сценарий:
 — точную структуру хука (что именно происходит в первые доли секунды, что за pattern interrupt) — бери из evidence паттерна;
 — темп и логику монтажных склеек, визуальную/операторскую эстетику — из evidence;
-— формулировки и лексику самого блогера, если в ретроспективе есть транскрипция соответствующего ролика (его слова-паразиты, характерные обороты, длину фраз) — сценарий должен звучать голосом блогера, а не рекламным языком.
+— формулировки и лексику самого блогера, если в ретроспективе есть транскрипция соответствующего ролика (его слова-паразиты, характерные обороты, длину фраз) — сценарий должен звучать голосом блогера, а не рекламным языком. Не заменяй зафиксированные слова-паразиты, самоопределения и уровень грубости блогера литературными синонимами и не достраивай оборванные фразы до грамматически полных — если блогер говорит с обрывами, сценарий обязан звучать так же.
 Продукт встраивается ВНУТРЬ этой структуры как естественный элемент, а не поверх неё. Если паттерн описывает, например, смену 3 образов под музыку с резкими склейками — сценарий сохраняет эту же логику, просто один из слоёв — товар.
 
 ═══════════════════════════════════
@@ -954,7 +1403,7 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
    — forecast_er — ожидаемый ER% числом (явная рекламная составляющая обычно немного снижает вовлечённость относительно чистого органического ролика);
    — virality_probability — вероятность залёта в процентах, ЦЕЛОЕ число от 0 до 100;
    — virality_reasoning — короткое (1-2 предложения) обоснование именно этой цифры: сила хука относительно анкора, сохранность retention-механик при адаптации, риски, которые добавляет рекламная интеграция.
-   Калибровка вероятности (будь реалистом, не оптимистом): если сценарий почти дословно копирует структуру сильного, хорошо подтверждённого паттерна и интеграция ненавязчива — вероятность может быть высокой, но обычно не выше 70-80%. Если паттерн основан на маленькой выборке или единичном выбросе, либо интеграция товара заметно утяжеляет ролик — вероятность должна быть умеренной или низкой (15-45%). Ставить 90%+ можно только в исключительных, явно обоснованных случаях: рекламные ролики систематически получают охват и вовлечение ниже органических, это статистическая норма, а не исключение.
+   Калибровка вероятности (будь реалистом, не оптимистом): если сценарий почти дословно копирует структуру сильного, хорошо подтверждённого паттерна и интеграция ненавязчива — вероятность может быть высокой, но обычно не выше 70-80%. Если паттерн основан на маленькой выборке или единичном выбросе, либо интеграция товара заметно утяжеляет ролик — вероятность должна быть умеренной или низкой (15-45%). Ставить 90%+ можно только в исключительных, явно обоснованных случаях: рекламные ролики систематически получают охват и вовлечение ниже органических, это статистическая норма, а не исключение. Если сценарий использует гипотезу (based_on_hypothesis заполнено) — бонус +5-10 п.п. к потолку (не выше 85% суммарно) применяй ТОЛЬКО если одновременно выполнены оба условия из раздела «РОЛЬ ГИПОТЕЗ БРЕНДА»: подтверждённая статистика гипотезы И качественное слияние (деталь из hypothesis_fusion_trace реально в теле сценария). При выполнении хотя бы одного из условий — без бонуса.
 5. Время публикации: возьми best_posting_time_msk из того, что аналитик уже отметил в evidence соответствующего паттерна (окно публикации залётных роликов), в формате "ЧЧ:ММ-ЧЧ:ММ МСК". Если аналитик не привёл эту информацию или данных недостаточно — честно напиши "недостаточно данных", не выдумывай.
 
 ФИНАЛЬНЫЙ ЧЕК-ЛИСТ ПЕРЕД ВЫВОДОМ (обязательно к каждому сценарию):
@@ -962,6 +1411,8 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
 — forecast_views_low/forecast_views_high/forecast_er, virality_probability (число 0-100), virality_reasoning и best_posting_time_msk заполнены (кроме best_posting_time_msk, где допустимо честно написать "недостаточно данных")?
 — hook и script держатся именно на анатомии конкретного паттерна, а не звучат как сценарий про любой другой товар?
 — товар и остальная одежда в кадре сочетаются так, как реальный человек носил бы их (без надевания одной утягивающей вещи на/под другую, без нелепых или невозможных сочетаний)?
+— слова блогера не заменены литературными синонимами, незавершённость фраз сохранена?
+— если based_on_hypothesis заполнено — hypothesis_fusion_trace заполнен, и деталь из него реально встречается в hook/script, а не только в самой трассировке?
 Если хотя бы один ответ «нет» — исправь перед выводом.
 
 {humanize_block}
@@ -974,6 +1425,9 @@ DEFAULT_SCRIPTWRITER_SYSTEM_PROMPT = """Ты — Senior креативный д�
       "title": "строка",
       "based_on_pattern": "строка — точное название паттерна из входных данных",
       "based_on_video": "строка — дата и краткое описание конкретного ролика-донора",
+      "based_on_hypothesis": "строка или null — точное title гипотезы из блока «ПРОВЕРЕННЫЕ ГИПОТЕЗЫ БРЕНДА», если использована",
+      "hypothesis_id": 0,
+      "hypothesis_fusion_trace": "строка или null — обязательна, если заполнено based_on_hypothesis",
       "anchor_url": "строка — ТОЧНО равно source_video_url соответствующего паттерна",
       "anchor_views": 0,
       "anchor_er": 0.0,
@@ -1013,7 +1467,23 @@ DEFAULT_EDITOR_SYSTEM_PROMPT = """Ты — Редактор и контролё�
    Если verdict="revise" по этому пункту — revision_notes должны называть КОНКРЕТНУЮ фразу для замены и в каком духе её переписать (не «сделай живее», а, например: «замени ‘это не просто майка, это стиль’ на прямую реплику в духе блогера — см. как он говорит в evidence: ...»).
 4. ЛЕГАЛЬНОСТЬ. Поле ad_marking_note должно содержать реальную инструкцию по маркировке рекламы, а не быть пустым или формальной отпиской.
 5. РЕАЛИСТИЧНОСТЬ ОБРАЗА. Товар — утягивающая БАЗОВАЯ майка: в реальной жизни её носят либо самостоятельным топом, либо невидимым под-слоем ПОД обычной одеждой (расстёгнутая рубашка, кардиган, жакет, платье-сарафан). Внимательно прочитай script и hook: если персонаж надевает товар поверх/под ДРУГУЮ утягивающую или компрессионную вещь (боди, корсет, бельё-утяжку, другой шейпер), либо в сценарии в принципе описана вещевая комбинация, которую реальный человек так не носит и не сочетает — это грубая логическая ошибка, а не мелочь. Даже при высоком fit_score и живом тексте такой сценарий получает verdict="revise" с конкретным указанием, какую комбинацию одежды заменить на жизненную.
-6. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный, нативный, звучит как живой человек и вещи в кадре сочетаются реалистично — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые, ИИ-шаблонные или нелепые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет, лимиты API и время — на каждый лишний круг доработки уходит отдельный вызов и Редактора, и Сценариста).
+6. СЛИЯНИЕ ПАТТЕРНА И ГИПОТЕЗЫ (проверяется только если based_on_hypothesis заполнено).
+   а) Если hypothesis_fusion_trace пусто или отсутствует — verdict="revise" автоматически, без
+      дальнейшего анализа этого пункта.
+   б) Возьми сегмент "Материализовано как" из hypothesis_fusion_trace и сверь буквально с текстом
+      hook и script. Если названная деталь нигде в теле сценария не встречается — это "пришито
+      отдельным блоком поверх", verdict="revise", независимо от качества остального текста.
+   в) Возьми сегмент "Почему это форма блогера" — он обязан называть конкретный элемент evidence
+      паттерна (конкретную фразу/приём/темп), а не общую фразу вроде "подходит стилю блогера".
+      Общая формулировка без конкретной ссылки — тот же вердикт.
+   г) Если в virality_reasoning заявлен бонус за гипотезу, но не процитированы times_used/
+      times_confirmed_viral, удовлетворяющие порогу (>=3 использований, >=50% подтверждений) —
+      это не повод для revise само по себе, но обязательно отметь в reason: вероятность завышена
+      без основания.
+   Наличие гипотезы, даже успешно слитой, никогда не заменяет и не смягчает требование fit_score
+   ="высокий" и привязку к анатомии паттерна блогера (пункт 2) — это независимые, не взаимозаменяемые
+   гейты.
+7. НЕ ПРИДИРАЙСЯ К МЕЛОЧАМ. Если сценарий уже сильный, конкретный, нативный, звучит как живой человек и вещи в кадре сочетаются реалистично — ставь "pass", даже если можно было бы сформулировать чуть иначе. Цель — отсеивать реально слабые, ИИ-шаблонные или нелепые сценарии, а не бесконечно шлифовать хорошие (это тратит бюджет, лимиты API и время — на каждый лишний круг доработки уходит отдельный вызов и Редактора, и Сценариста).
 
 Если verdict="revise" — поле revision_notes должно быть конкретной инструкцией для сценариста: что именно усилить или переписать (не общие слова вроде «сделай лучше», а конкретика: «хук не привязан к анатомии паттерна — используй деталь из evidence про смену кадра на 0.5 секунде», «fit средний из-за того что товар вставлен поверх сценария, а не внутрь — переставь появление майки в момент смены образа, как в оригинале»).
 
@@ -1032,7 +1502,26 @@ DEFAULT_EDITOR_AUTO_MODELS = [
     "minimax/minimax-m3:free",
 ]
 
-init_db()
+try:
+    init_db()
+except Exception as _db_setup_error:
+    # Раньше здесь ловился только наш собственный RuntimeError (нет секрета/библиотеки),
+    # но реальная сетевая ошибка от psycopg2 (неверный порт, таймаут, недоступен хост,
+    # неверный пароль) — это psycopg2.OperationalError, а не RuntimeError, и без этого
+    # except она бы просто уронила приложение с непонятным трейсбеком. Теперь причина
+    # всегда видна прямо на экране — это и есть самая надёжная проверка того, что
+    # выбранный порт/строка подключения реально работают именно из Streamlit Cloud.
+    st.error(
+        "⚠️ Не удалось подключиться к базе данных Supabase.\n\n"
+        f"Техническая причина: {_db_setup_error}\n\n"
+        "Частые причины: строка SUPABASE_DB_URL в Secrets скопирована с ошибкой, "
+        "устарел пароль базы, или недоступен порт из строки подключения. "
+        "Если ошибка про таймаут/недоступность именно порта 6543 (Transaction pooler) — "
+        "попробуйте Session pooler на порту 5432 (тоже работает по IPv4 на бесплатном "
+        "тарифе Supabase) — просто замените строку в Secrets на неё, дважды всё "
+        "остальное менять не нужно."
+    )
+    st.stop()
 
 if "admin_logged_in" not in st.session_state:
     st.session_state.admin_logged_in = False
@@ -1815,7 +2304,7 @@ def build_analyst_user_prompt(blogger_url, product_brief, metrics_df, median_vie
 
 
 def build_scriptwriter_user_prompt(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df,
-                                    patterns, viral_stats=None, previous_scenarios=None):
+                                    patterns, viral_stats=None, previous_scenarios=None, matched_hypotheses=None):
     table_records = metrics_df.drop(columns=["Транскрипция (если есть)"], errors="ignore").to_dict(orient="records")
     viral_block = ""
     if top_viral_df is not None and not top_viral_df.empty:
@@ -1848,15 +2337,17 @@ def build_scriptwriter_user_prompt(blogger_url, product_brief, metrics_df, media
             "другие паттерны из переданного списка, если их несколько. Не повторяй дословно прежние формулировки хуков и сценариев.\n"
             f"Прежние сценарии (их НЕ повторять):\n{prev_lines}"
         )
+    hypotheses_block = build_hypotheses_prompt_block(matched_hypotheses)
     return (
         f"Блогер: {blogger_url}\nМедиана просмотров: {median_views:.0f}\nНужно сценариев: {n_scenarios}\n\n"
         f"Бриф о товаре:\n{product_brief}\n\nВсе загруженные ролики:\n"
-        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{regen_block}"
+        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{regen_block}{hypotheses_block}"
     )
 
 
 def build_scriptwriter_user_prompt_single(blogger_url, product_brief, metrics_df, median_views, top_viral_df,
-                                           patterns, viral_stats, all_scenarios, target_index, editor_feedback=None):
+                                           patterns, viral_stats, all_scenarios, target_index, editor_feedback=None,
+                                           matched_hypotheses=None):
     """
     Промпт для точечного обновления ОДНОГО сценария (кнопка «🔄 Обновить сценарий» у конкретной карточки,
     либо автоматический перезапуск после замечания редактора при QC-проверке).
@@ -1913,10 +2404,11 @@ def build_scriptwriter_user_prompt_single(blogger_url, product_brief, metrics_df
             "была отклонена контролем качества, цель — довести fit_score строго до \"высокий\" и убрать "
             f"все отмеченные слабые места):\n{editor_feedback}"
         )
+    hypotheses_block = build_hypotheses_prompt_block(matched_hypotheses)
     return (
         f"Блогер: {blogger_url}\nМедиана просмотров: {median_views:.0f}\n\n"
         f"Бриф о товаре:\n{product_brief}\n\nВсе загруженные ролики:\n"
-        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{instruction}{editor_block}"
+        f"{json.dumps(table_records, ensure_ascii=False, indent=2)}{viral_block}{patterns_block}{stats_block}{instruction}{editor_block}{hypotheses_block}"
     )
 
 
@@ -1938,15 +2430,19 @@ def run_analyst_stage(blogger_url, product_brief, metrics_df, median_views, top_
     parsed.setdefault("audience_summary", "")
     parsed.setdefault("patterns", [])
     parsed.setdefault("verdict_note", "")
+    parsed.setdefault("blogger_type_tags", [])
+    parsed.setdefault("audience_pain_points", [])
     return parsed, raw_text, model_used, attempts_log
 
 
 def run_scriptwriter_stage(blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df,
                             patterns, provider_mode, base_url, api_key, mode, manual_model, auto_models,
-                            max_tokens, system_prompt, viral_stats=None, previous_scenarios=None):
+                            max_tokens, system_prompt, viral_stats=None, previous_scenarios=None,
+                            matched_hypotheses=None):
     user_prompt = build_scriptwriter_user_prompt(
         blogger_url, product_brief, metrics_df, median_views, n_scenarios, top_viral_df,
         patterns, viral_stats=viral_stats, previous_scenarios=previous_scenarios,
+        matched_hypotheses=matched_hypotheses,
     )
     parsed, raw_text, model_used, attempts_log = call_role_with_failover(
         "Сценарист", provider_mode, base_url, api_key, mode, manual_model, auto_models,
@@ -1962,10 +2458,10 @@ def run_scriptwriter_stage(blogger_url, product_brief, metrics_df, median_views,
 def run_scriptwriter_single_stage(blogger_url, product_brief, metrics_df, median_views, top_viral_df, patterns,
                                    viral_stats, all_scenarios, target_index,
                                    provider_mode, base_url, api_key, mode, manual_model, auto_models,
-                                   max_tokens, system_prompt, editor_feedback=None):
+                                   max_tokens, system_prompt, editor_feedback=None, matched_hypotheses=None):
     user_prompt = build_scriptwriter_user_prompt_single(
         blogger_url, product_brief, metrics_df, median_views, top_viral_df, patterns, viral_stats,
-        all_scenarios, target_index, editor_feedback=editor_feedback,
+        all_scenarios, target_index, editor_feedback=editor_feedback, matched_hypotheses=matched_hypotheses,
     )
     parsed, raw_text, model_used, attempts_log = call_role_with_failover(
         "Сценарист", provider_mode, base_url, api_key, mode, manual_model, auto_models,
@@ -2034,7 +2530,7 @@ def run_scenario_qc_pass(scenarios, patterns, blogger_url, product_brief, metric
                           editor_mode, editor_manual_model, editor_auto_models, editor_max_tokens, editor_system_prompt,
                           scriptwriter_mode, scriptwriter_manual_model, scriptwriter_auto_models,
                           scriptwriter_max_tokens, scriptwriter_system_prompt,
-                          max_revisions=1, only_indices=None):
+                          max_revisions=1, only_indices=None, matched_hypotheses=None):
     """
     Прогоняет каждый сценарий через Редактора и, если он требует доработки (verdict="revise"),
     просит Сценариста переписать РОВНО этот сценарий с учётом revision_notes — до max_revisions
@@ -2078,7 +2574,7 @@ def run_scenario_qc_pass(scenarios, patterns, blogger_url, product_brief, metric
                 scenarios, idx,
                 provider_mode, base_url, api_key, scriptwriter_mode, scriptwriter_manual_model,
                 scriptwriter_auto_models, scriptwriter_max_tokens, scriptwriter_system_prompt,
-                editor_feedback=verdict_result.get("revision_notes", ""),
+                editor_feedback=verdict_result.get("revision_notes", ""), matched_hypotheses=matched_hypotheses,
             )
             qc_log.extend(sw_attempts_log)
             new_list = rewritten.get("scenarios") or []
@@ -3476,7 +3972,12 @@ else:
                 for k in apify_keys_list:
                     marker = {"green": "🟢", "red": "🔴"}.get(k.get("status"), "⚪")
                     token = k["token"]
+                    show_key_flag = f"show_apify_{k['id']}"
+                    if show_key_flag not in st.session_state:
+                        st.session_state[show_key_flag] = False
+                    is_revealed = st.session_state[show_key_flag]
                     masked = f"{token[:6]}…{token[-4:]}" if len(token) > 12 else f"…{token[-4:]}"
+                    display_token = token if is_revealed else masked
                     added = (k.get("date_added") or "").replace("T", " ")[:16]
                     checked = (k.get("last_checked_at") or "").replace("T", " ")[:16] or "не проверялся"
                     reset_at = k.get("cycle_reset_at")
@@ -3486,7 +3987,7 @@ else:
                     st.markdown(f"""
                         <div class="history-card fade-in-container">
                             <div style="display:flex; justify-content:space-between; align-items:flex-start;">
-                                <div class="history-handle">{marker} {html.escape(masked)}</div>
+                                <div class="history-handle">{marker} {html.escape(display_token)}</div>
                                 <div class="history-date">добавлен: {added}</div>
                             </div>
                             <div>
@@ -3497,7 +3998,7 @@ else:
                         </div>
                     """, unsafe_allow_html=True)
 
-                    kc1, kc2 = st.columns(2)
+                    kc1, kc2, kc3 = st.columns(3)
                     with kc1:
                         if st.button("🔄 Проверить", key=f"check_apify_{k['id']}", use_container_width=True):
                             live = check_apify_key_live(token)
@@ -3516,6 +4017,11 @@ else:
                                 st.error(f"Не удалось проверить: {live.get('error')}")
                             st.rerun()
                     with kc2:
+                        eye_label = "🙈 Скрыть ключ" if is_revealed else "👁 Показать ключ"
+                        if st.button(eye_label, key=f"eye_apify_{k['id']}", use_container_width=True):
+                            st.session_state[show_key_flag] = not is_revealed
+                            st.rerun()
+                    with kc3:
                         if st.button("🗑 Удалить", key=f"del_apify_{k['id']}", use_container_width=True):
                             ok, msg = delete_apify_key(k["id"])
                             if ok:
@@ -3523,6 +4029,28 @@ else:
                                 st.rerun()
                             else:
                                 st.error(msg)
+
+                    if is_revealed:
+                        edit_c1, edit_c2 = st.columns([4, 1])
+                        with edit_c1:
+                            edited_token_value = st.text_input(
+                                "Полный ключ (можно отредактировать и сохранить)",
+                                value=token, key=f"edit_apify_{k['id']}", label_visibility="collapsed",
+                            )
+                        with edit_c2:
+                            if st.button("💾 Сохранить", key=f"save_apify_{k['id']}", use_container_width=True):
+                                new_token_value = sanitize_apify_token(edited_token_value)
+                                if not new_token_value:
+                                    st.error("Ключ не может быть пустым.")
+                                elif new_token_value == token:
+                                    st.info("Изменений нет.")
+                                else:
+                                    if update_apify_key_token(k["id"], new_token_value):
+                                        st.success("Ключ обновлён.")
+                                        st.session_state[show_key_flag] = False
+                                        st.rerun()
+                                    else:
+                                        st.error("Не удалось сохранить ключ — возможно, такой ключ уже есть в списке.")
 
     with tab_history:
         if is_admin:
@@ -3834,6 +4362,14 @@ else:
                                 for line in analyst_log: st.code(line, language="text")
                                 if analyst_raw: st.code(analyst_raw, language="text")
 
+                        # --- Матчинг базы гипотез под этого блогера (без нового вызова ИИ — чистый тег-скоринг). ---
+                        matched_hypotheses = match_hypotheses_for_blogger(
+                            blogger_type_tags=analyst_result.get("blogger_type_tags", []),
+                            patterns_format_tags=[],
+                            audience_pain_points=analyst_result.get("audience_pain_points", []),
+                        )
+                        st.session_state.matched_hypotheses = matched_hypotheses  # переиспользуется при перегенерации
+
                         scriptwriter_result, scriptwriter_raw, scriptwriter_model_used, scriptwriter_log = (
                             fallback_scriptwriter_result("аналитик недоступен"), None, None, []
                         )
@@ -3845,7 +4381,7 @@ else:
                                     analyst_result.get("patterns", []), active_provider_mode, active_base_url,
                                     st.session_state.cfg_ai_key, active_scriptwriter_mode, active_scriptwriter_manual_model,
                                     active_scriptwriter_auto_models, active_max_tokens, active_scriptwriter_system_prompt,
-                                    viral_stats=viral_stats,
+                                    viral_stats=viral_stats, matched_hypotheses=matched_hypotheses,
                                 )
                         else:
                             st.markdown("""<div class="custom-error fade-in-container"><i class="fa-solid fa-circle-exclamation"></i> ИИ-аналитик не ответил ни одной моделью из списка — сценарист не запускался. Проверьте ключ/модели в панели администратора.</div>""", unsafe_allow_html=True)
@@ -3876,7 +4412,7 @@ else:
                                     active_editor_max_tokens, active_editor_system_prompt,
                                     active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                     active_max_tokens, active_scriptwriter_system_prompt,
-                                    max_revisions=active_qc_max_revisions,
+                                    max_revisions=active_qc_max_revisions, matched_hypotheses=matched_hypotheses,
                                 )
                                 result = backfill_missing_media_data(result, metrics_df, top_viral_df, viral_stats)
                         if qc_log_initial:
@@ -3978,6 +4514,7 @@ else:
                         active_provider_mode, active_base_url, st.session_state.cfg_ai_key,
                         active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                         active_max_tokens, active_scriptwriter_system_prompt,
+                        matched_hypotheses=st.session_state.get("matched_hypotheses", []),
                     )
                 if single_log:
                     with st.expander(f"🔍 Ход вызова ИИ-сценариста (обновление сценария №{clicked_scenario_idx + 1})"):
@@ -4006,6 +4543,7 @@ else:
                                 active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                 active_max_tokens, active_scriptwriter_system_prompt,
                                 max_revisions=active_qc_max_revisions, only_indices={clicked_scenario_idx},
+                                matched_hypotheses=st.session_state.get("matched_hypotheses", []),
                             )
                             la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
                     if qc_log_single:
@@ -4037,6 +4575,7 @@ else:
                         active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                         active_max_tokens, active_scriptwriter_system_prompt,
                         viral_stats=la.get("viral_stats"), previous_scenarios=la["result"].get("scenarios"),
+                        matched_hypotheses=st.session_state.get("matched_hypotheses", []),
                     )
                 if refresh_log:
                     with st.expander("🔍 Ход вызова ИИ-сценариста (обновление сценариев)"):
@@ -4060,6 +4599,7 @@ else:
                                 active_scriptwriter_mode, active_scriptwriter_manual_model, active_scriptwriter_auto_models,
                                 active_max_tokens, active_scriptwriter_system_prompt,
                                 max_revisions=active_qc_max_revisions,
+                                matched_hypotheses=st.session_state.get("matched_hypotheses", []),
                             )
                             la["result"] = backfill_missing_media_data(la["result"], la["metrics_df"], la["top_viral_df"], la.get("viral_stats"))
                     if qc_log_refresh:
