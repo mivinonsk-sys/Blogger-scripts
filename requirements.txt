@@ -1,5 +1,5 @@
 streamlit
 openai
-anthropic
 pandas
+psycopg2-binary
 httpx
